@@ -27,7 +27,7 @@ Deploys [dnstm](https://github.com/net2share/dnstm) DNS tunnel servers with **Sl
 - [💖 Donate](#-donate)
 - [📄 License](#-license)
 - [👤 Author](#-author)
-- [🇮🇷 راهنمای فارسی](#-راهنمای-فارسی)
+- [📖 راهنمای فارسی](#-راهنمای-فارسی)
 
 ---
 
@@ -583,7 +583,7 @@ Made By **SamNet Technologies** — Saman
 
 <div dir="rtl">
 
-# 🇮🇷 راهنمای فارسی
+# 📖 راهنمای فارسی
 
 ## dnstm-setup — ابزار نصب خودکار تانل DNS
 
