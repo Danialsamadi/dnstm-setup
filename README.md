@@ -65,10 +65,10 @@ Because the traffic looks like ordinary DNS resolution, it passes through filter
      v
   🔀 DNS Router (multiplexes port 53)
      |
-     +---> t2.domain ---> Slipstream ---> microsocks (:19801) ---> 🌐 Internet
+     +---> t2.domain ---> Slipstream ---> microsocks (SOCKS5) ---> 🌐 Internet
      |                    (QUIC + TLS)
      |
-     +---> d2.domain ---> DNSTT --------> microsocks (:19801) ---> 🌐 Internet
+     +---> d2.domain ---> DNSTT --------> microsocks (SOCKS5) ---> 🌐 Internet
      |                    (Noise + Curve25519)
      |
      +---> s2.domain ---> Slipstream ---> SSH Tunnel ------------> 🌐 Internet
@@ -98,7 +98,7 @@ When someone queries `t2.yourdomain.com`, the global DNS system follows this cha
 | 🔀 **DNS Router** | Port 53 multiplexer | Inspects incoming DNS queries and routes them to the correct tunnel by subdomain |
 | ⚡ **Slipstream Server** | QUIC-based DNS tunnel | TLS encryption with self-signed certificates — Speed: **~63 KB/s** |
 | 🔐 **DNSTT Server** | Classic DNS tunnel | Noise protocol with Curve25519 key pairs — Speed: **~42 KB/s** |
-| 🧦 **microsocks** | SOCKS5 proxy | Lightweight proxy on port 19801, shared by all tunnels |
+| 🧦 **microsocks** | SOCKS5 proxy | Lightweight proxy shared by all tunnels (port auto-assigned by dnstm) |
 | 👤 **sshtun-user** | SSH user manager | *(Optional)* Creates restricted users that can only do port forwarding |
 
 ### 🚇 Three Tunnel Types
@@ -232,7 +232,7 @@ The wizard has **12 steps**. Here's what each one does:
 
 - Checks if microsocks is running (process or systemd service)
 - Starts it if not running
-- Tests the SOCKS proxy by making a request through `127.0.0.1:19801`
+- Tests the SOCKS proxy by detecting the microsocks port and making a request through it
 </details>
 
 <details>
@@ -429,8 +429,8 @@ dnstm tunnel start --tag slip1
 dnstm router stop
 dnstm router start
 
-# 🧪 Test the SOCKS proxy locally
-curl --socks5 127.0.0.1:19801 https://api.ipify.org
+# 🧪 Test the SOCKS proxy locally (check port with: ss -tlnp | grep microsocks)
+curl --socks5 127.0.0.1:<MICROSOCKS_PORT> https://api.ipify.org
 ```
 
 ---
@@ -453,6 +453,9 @@ sudo bash dnstm-setup.sh --uninstall
 - ⚠️ DNS records in Cloudflare — delete them from your dashboard
 - ⚠️ systemd-resolved — re-enable with:
   ```bash
+  chattr -i /etc/resolv.conf 2>/dev/null
+  rm /etc/resolv.conf && ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  systemctl unmask systemd-resolved.socket systemd-resolved.service
   systemctl enable systemd-resolved && systemctl start systemd-resolved
   ```
 
@@ -475,10 +478,15 @@ If you prefer to set things up manually step by step (without this script), foll
 # Check what's using port 53
 ss -ulnp | grep ':53 '
 
-# If systemd-resolved is still there, force it
-systemctl stop systemd-resolved
-systemctl disable systemd-resolved
+# If systemd-resolved is still there, force it (stop socket too!)
+systemctl stop systemd-resolved.socket systemd-resolved.service
+systemctl disable systemd-resolved.socket systemd-resolved.service
+systemctl mask systemd-resolved.socket systemd-resolved.service
+pkill -9 systemd-resolve
+# Fix resolv.conf (remove symlink, write real file, lock it)
+chattr -i /etc/resolv.conf 2>/dev/null; rm -f /etc/resolv.conf
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
+chattr +i /etc/resolv.conf
 ```
 </details>
 
@@ -510,8 +518,8 @@ systemctl status microsocks
 # Restart it
 systemctl restart microsocks
 
-# Test locally
-curl --socks5 127.0.0.1:19801 https://api.ipify.org
+# Test locally (check port with: ss -tlnp | grep microsocks)
+curl --socks5 127.0.0.1:<MICROSOCKS_PORT> https://api.ipify.org
 ```
 </details>
 
@@ -624,8 +632,8 @@ Made By **SamNet Technologies** — Saman
      v
   🔀 DNS Router (مالتی‌پلکسر)
      |
-     +---> t2.domain ---> Slipstream ---> microsocks (:19801) ---> 🌐 اینترنت
-     +---> d2.domain ---> DNSTT --------> microsocks (:19801) ---> 🌐 اینترنت
+     +---> t2.domain ---> Slipstream ---> microsocks (SOCKS5) ---> 🌐 اینترنت
+     +---> d2.domain ---> DNSTT --------> microsocks (SOCKS5) ---> 🌐 اینترنت
      +---> s2.domain ---> Slip+SSH -----> تانل SSH --------------> 🌐 اینترنت
 ```
 
@@ -713,7 +721,7 @@ sudo bash dnstm-setup.sh
 6. 🔍 **بررسی پورت 53** — تأیید اینکه DNS Router روی پورت 53 گوش می‌دهد
 7. 🚇 **ایجاد تانل‌ها** — ساخت ۳ تانل (Slipstream+SOCKS، DNSTT+SOCKS، Slipstream+SSH)
 8. ▶️ **شروع سرویس‌ها** — راه‌اندازی روتر و تمام تانل‌ها
-9. 🧦 **بررسی پروکسی SOCKS** — تست microsocks روی پورت 19801
+9. 🧦 **بررسی پروکسی SOCKS** — تست microsocks (تشخیص خودکار پورت)
 10. 👤 **کاربر SSH** (اختیاری) — ایجاد کاربر محدود برای تانل SSH
 11. 🧪 **تست‌های نهایی** — ۴ تست خودکار برای تأیید عملکرد
 12. 📊 **خلاصه** — نمایش تمام اطلاعات اتصال
@@ -809,8 +817,8 @@ dnstm tunnel logs --tag slip1
 dnstm tunnel stop --tag slip1
 dnstm tunnel start --tag slip1
 
-# 🧪 تست پروکسی SOCKS
-curl --socks5 127.0.0.1:19801 https://api.ipify.org
+# 🧪 تست پروکسی SOCKS (بررسی پورت: ss -tlnp | grep microsocks)
+curl --socks5 127.0.0.1:<MICROSOCKS_PORT> https://api.ipify.org
 ```
 
 <div dir="rtl">
@@ -825,9 +833,12 @@ curl --socks5 127.0.0.1:19801 https://api.ipify.org
 
 ```bash
 ss -ulnp | grep ':53 '
-systemctl stop systemd-resolved
-systemctl disable systemd-resolved
+systemctl stop systemd-resolved.socket systemd-resolved.service
+systemctl mask systemd-resolved.socket systemd-resolved.service
+pkill -9 systemd-resolve
+chattr -i /etc/resolv.conf 2>/dev/null; rm -f /etc/resolv.conf
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
+chattr +i /etc/resolv.conf
 ```
 
 <div dir="rtl">
@@ -871,6 +882,9 @@ sudo bash dnstm-setup.sh --uninstall
 </div>
 
 ```bash
+chattr -i /etc/resolv.conf 2>/dev/null
+rm /etc/resolv.conf && ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+systemctl unmask systemd-resolved.socket systemd-resolved.service
 systemctl enable systemd-resolved && systemctl start systemd-resolved
 ```
 

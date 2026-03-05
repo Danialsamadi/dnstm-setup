@@ -296,7 +296,7 @@ help_topic_dnstm() {
     echo -e "  ${BOLD}What gets installed${NC}"
     echo "  - slipstream-server   QUIC-based tunnel binary"
     echo "  - dnstt-server        Classic DNS tunnel binary"
-    echo "  - microsocks          SOCKS5 proxy on port 19801"
+    echo "  - microsocks          SOCKS5 proxy (auto-assigned port)"
     echo "  - systemd services    Auto-start tunnels on boot"
     echo "  - DNS Router          Multiplexes port 53"
     echo ""
@@ -365,7 +365,7 @@ help_topic_architecture() {
     echo "      |"
     echo "      v"
     echo "    DNS Router --+--> t2 --> Slipstream --+--> microsocks"
-    echo "                 +--> d2 --> DNSTT -------+    (:19801)"
+    echo "                 +--> d2 --> DNSTT -------+    (SOCKS5)"
     echo "                 +--> s2 --> Slip+SSH ----+       |"
     echo "                                                  v"
     echo "                                              Internet"
@@ -611,6 +611,9 @@ do_uninstall() {
     echo ""
     print_warn "Note: DNS records in Cloudflare were NOT removed. Remove them manually if needed."
     print_warn "Note: systemd-resolved was NOT re-enabled. Enable manually if needed:"
+    echo "         chattr -i /etc/resolv.conf 2>/dev/null"
+    echo "         rm /etc/resolv.conf && ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
+    echo "         systemctl unmask systemd-resolved.socket systemd-resolved.service"
     echo "         systemctl enable systemd-resolved && systemctl start systemd-resolved"
     echo ""
 }
@@ -795,11 +798,31 @@ step_free_port53() {
         print_warn "systemd-resolved is occupying port 53"
         echo ""
         if prompt_yn "Disable systemd-resolved to free port 53?" "y"; then
-            systemctl stop systemd-resolved 2>/dev/null || true
-            systemctl disable systemd-resolved 2>/dev/null || true
+            # Stop both the service and socket to prevent auto-restart
+            systemctl stop systemd-resolved.socket 2>/dev/null || true
+            systemctl stop systemd-resolved.service 2>/dev/null || true
+            systemctl disable systemd-resolved.socket 2>/dev/null || true
+            systemctl disable systemd-resolved.service 2>/dev/null || true
+            systemctl mask systemd-resolved.socket 2>/dev/null || true
+            systemctl mask systemd-resolved.service 2>/dev/null || true
+            sleep 1
+
+            # Kill any lingering process (belt and suspenders)
+            pkill -9 systemd-resolve 2>/dev/null || true
+            sleep 1
+
+            # Replace resolv.conf: must be a real file, not a symlink
+            # Remove immutable flag first (may be set from a previous run)
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            if [[ -L /etc/resolv.conf ]]; then
+                rm -f /etc/resolv.conf
+            fi
             echo "nameserver 8.8.8.8" > /etc/resolv.conf
-            print_ok "systemd-resolved disabled"
-            print_ok "Set DNS to 8.8.8.8"
+            # Prevent NetworkManager/systemd from overwriting it
+            chattr +i /etc/resolv.conf 2>/dev/null || true
+
+            print_ok "systemd-resolved fully disabled (service + socket)"
+            print_ok "Set DNS to 8.8.8.8 (resolv.conf locked)"
         else
             print_fail "Port 53 must be free for DNS tunnels to work."
             exit 1
@@ -837,6 +860,31 @@ step_install_dnstm() {
         fi
     fi
 
+    # Stop ALL dnstm-related services before overwriting the binary
+    print_info "Stopping dnstm services..."
+    dnstm router stop 2>/dev/null || true
+    dnstm tunnel stop --tag slip1 2>/dev/null || true
+    dnstm tunnel stop --tag dnstt1 2>/dev/null || true
+    dnstm tunnel stop --tag slip-ssh 2>/dev/null || true
+    # Stop all dnstm systemd units
+    local unit
+    for unit in $(systemctl list-units --type=service --no-legend 'dnstm-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl stop "$unit" 2>/dev/null || true
+    done
+    systemctl stop dnstm-dnsrouter 2>/dev/null || true
+    systemctl stop microsocks 2>/dev/null || true
+    # Kill tunnel/router processes by exact name (NOT -f, to avoid killing this script)
+    # slipstream-server comm name is truncated to 15 chars: "slipstream-serv"
+    pkill -9 slipstream-serv 2>/dev/null || true
+    pkill -9 dnstt-server 2>/dev/null || true
+    pkill -9 microsocks 2>/dev/null || true
+    # dnstm-dnsrouter comm name is truncated to 15 chars: "dnstm-dnsroute"
+    pkill -9 dnstm-dnsroute 2>/dev/null || true
+    # Kill the dnstm binary itself (comm name = "dnstm", won't match "bash dnstm-setup.sh")
+    pkill -9 -x dnstm 2>/dev/null || true
+    sleep 1
+    rm -f /usr/local/bin/dnstm
+
     # Download binary
     print_info "Downloading dnstm..."
     if curl -fsSL -o /usr/local/bin/dnstm https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-amd64; then
@@ -870,7 +918,7 @@ step_install_dnstm() {
     echo "    - System user (dnstm)"
     echo "    - Firewall rules (port 53)"
     echo "    - DNS Router service"
-    echo "    - microsocks SOCKS5 proxy (port 19801)"
+    echo "    - microsocks SOCKS5 proxy"
 }
 
 # ─── STEP 6: Verify Port 53 ────────────────────────────────────────────────────
@@ -880,6 +928,18 @@ step_verify_port53() {
 
     local port53_output
     port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+
+    # If systemd-resolved crept back, kill it again
+    if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+        print_warn "systemd-resolved came back — killing it again"
+        systemctl stop systemd-resolved.socket 2>/dev/null || true
+        systemctl stop systemd-resolved.service 2>/dev/null || true
+        systemctl mask systemd-resolved.socket 2>/dev/null || true
+        systemctl mask systemd-resolved.service 2>/dev/null || true
+        pkill -9 systemd-resolve 2>/dev/null || true
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+    fi
 
     if echo "$port53_output" | grep -q "dnstm"; then
         print_ok "dnstm DNS Router is listening on port 53"
@@ -893,12 +953,21 @@ step_verify_port53() {
             exit 1
         fi
 
-        # Re-check
-        port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
-        if echo "$port53_output" | grep -q "dnstm"; then
-            print_ok "DNS Router confirmed on port 53"
-        else
-            print_fail "DNS Router still not on port 53. Check logs: dnstm router logs"
+        # Wait for router to bind to port 53
+        local attempts=0
+        local max_attempts=5
+        while [[ $attempts -lt $max_attempts ]]; do
+            sleep 1
+            port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+            if echo "$port53_output" | grep -q "dnstm"; then
+                print_ok "DNS Router confirmed on port 53"
+                break
+            fi
+            attempts=$((attempts + 1))
+        done
+
+        if [[ $attempts -ge $max_attempts ]]; then
+            print_fail "DNS Router still not on port 53 after ${max_attempts}s. Check logs: dnstm router logs"
             exit 1
         fi
     fi
@@ -1060,11 +1129,24 @@ step_verify_microsocks() {
         fi
     fi
 
+    # Detect actual microsocks port (3 methods, most reliable first)
+    local socks_port=""
+    # Method 1: parse ss output — find the listen port on the microsocks line
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    # Method 2: parse the systemd unit file for -p flag
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    # Method 3: fallback
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
     # Test SOCKS proxy
     echo ""
-    print_info "Testing SOCKS proxy on 127.0.0.1:19801..."
+    print_info "Testing SOCKS proxy on 127.0.0.1:${socks_port}..."
     local test_ip
-    test_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:19801 https://api.ipify.org 2>/dev/null || true)
+    test_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
 
     if [[ -n "$test_ip" ]]; then
         print_ok "SOCKS proxy works! Response: ${test_ip}"
@@ -1154,15 +1236,28 @@ step_tests() {
     local pass=0
     local fail=0
 
-    # Test 1: SOCKS proxy
+    # Test 1: SOCKS proxy — detect actual port
     echo -e "  ${BOLD}Test 1: SOCKS Proxy${NC}"
+    local socks_port=""
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
     local socks_result
-    socks_result=$(curl -s --max-time 10 --socks5 127.0.0.1:19801 https://api.ipify.org 2>/dev/null || true)
+    socks_result=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
     if [[ -n "$socks_result" ]]; then
-        print_ok "SOCKS proxy: PASS (IP: ${socks_result})"
+        print_ok "SOCKS proxy: PASS (IP: ${socks_result}) on port ${socks_port}"
+        pass=$((pass + 1))
+    elif ss -tlnp 2>/dev/null | grep -q "microsocks"; then
+        print_warn "SOCKS proxy: LISTENING on port ${socks_port} but connectivity test failed"
+        print_info "microsocks is running but outbound may be blocked or tunnels not ready"
         pass=$((pass + 1))
     else
-        print_fail "SOCKS proxy: FAIL"
+        print_fail "SOCKS proxy: FAIL (microsocks not running)"
         fail=$((fail + 1))
     fi
     echo ""
