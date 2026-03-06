@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dnstm-setup v1.0
+# dnstm-setup v1.1
 # Interactive DNS Tunnel Setup
 # Sets up Slipstream + DNSTT tunnels for censorship-resistant internet access
 #
@@ -464,6 +464,7 @@ show_help() {
     echo -e "${BOLD}USAGE${NC}"
     echo "  sudo bash dnstm-setup.sh              Run interactive setup"
     echo "  sudo bash dnstm-setup.sh --add-domain  Add a backup domain to existing setup"
+    echo "  sudo bash dnstm-setup.sh --harden      Apply security hardening only"
     echo "  sudo bash dnstm-setup.sh --uninstall   Remove everything"
     echo "  bash dnstm-setup.sh --help             Show this help"
     echo "  bash dnstm-setup.sh --about            Show project info"
@@ -472,6 +473,7 @@ show_help() {
     echo "  --help         Show this help message"
     echo "  --about        Show project information and credits"
     echo "  --add-domain   Add another domain to an existing server (backup/fallback)"
+    echo "  --harden       Apply service and resolver hardening to an existing setup"
     echo "  --uninstall    Remove all installed components"
     echo ""
     echo -e "${BOLD}WHAT THIS SCRIPT SETS UP${NC}"
@@ -539,6 +541,195 @@ show_about() {
     echo "  Made By SamNet Technologies - Saman"
     echo "  https://github.com/SamNet-dev"
     echo ""
+}
+
+# ─── Security Hardening Helpers ────────────────────────────────────────────────
+
+configure_systemd_resolved_no_stub() {
+    # Keep system DNS working while freeing port 53 from the local stub listener.
+    if ! command -v systemctl &>/dev/null; then
+        print_warn "systemctl not found; skipping resolver hardening"
+        return 0
+    fi
+
+    if ! systemctl list-unit-files --type=service 2>/dev/null | grep -q '^systemd-resolved\.service'; then
+        print_warn "systemd-resolved is not installed; skipping resolver hardening"
+        return 0
+    fi
+
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/10-dnstm-no-stub.conf <<'EOF'
+[Resolve]
+DNSStubListener=no
+EOF
+
+    # If a previous run locked resolv.conf, unlock it before relinking.
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    systemctl unmask systemd-resolved.service systemd-resolved.socket 2>/dev/null || true
+    systemctl enable systemd-resolved.service 2>/dev/null || true
+    if ! systemctl restart systemd-resolved.service 2>/dev/null; then
+        print_warn "Could not restart systemd-resolved; keeping current resolver setup"
+        return 1
+    fi
+
+    if [[ -e /run/systemd/resolve/resolv.conf ]]; then
+        ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    fi
+
+    return 0
+}
+
+write_service_override() {
+    local unit="$1"
+    local run_user="$2"
+    local run_group="$3"
+    local needs_bind_cap="${4:-no}"
+    local dropin_dir="/etc/systemd/system/${unit}.d"
+    local dropin_file="${dropin_dir}/20-hardening.conf"
+
+    mkdir -p "$dropin_dir"
+
+    cat > "$dropin_file" <<EOF
+[Service]
+User=${run_user}
+Group=${run_group}
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+EOF
+
+    if [[ "$needs_bind_cap" == "yes" ]]; then
+        cat >> "$dropin_file" <<'EOF'
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+EOF
+    else
+        cat >> "$dropin_file" <<'EOF'
+AmbientCapabilities=
+CapabilityBoundingSet=
+EOF
+    fi
+}
+
+unit_exists() {
+    local unit="$1"
+    systemctl cat "$unit" >/dev/null 2>&1
+}
+
+enable_autostart_units() {
+    local dnstm_units unit
+    dnstm_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnstm-.*\.service$/ {print $1}' || true)
+    for unit in $dnstm_units microsocks.service; do
+        if ! unit_exists "$unit"; then
+            continue
+        fi
+        if ! systemctl enable "$unit" >/dev/null 2>&1; then
+            print_warn "Could not enable ${unit} for boot autostart"
+        fi
+    done
+    print_ok "Boot autostart enabled for dnstm and microsocks services"
+}
+
+apply_service_hardening() {
+    print_info "Applying least-privilege service hardening..."
+
+    if ! id -u dnstm &>/dev/null; then
+        if useradd --system --home /nonexistent --shell /usr/sbin/nologin dnstm 2>/dev/null; then
+            print_ok "Created service account: dnstm"
+        else
+            print_fail "Could not create service account: dnstm"
+            return 1
+        fi
+    fi
+
+    if [[ -d /etc/dnstm ]]; then
+        chown -R root:dnstm /etc/dnstm 2>/dev/null || true
+        find /etc/dnstm -type d -exec chmod 750 {} + 2>/dev/null || true
+        find /etc/dnstm -type f -exec chmod 640 {} + 2>/dev/null || true
+        find /etc/dnstm -type f \( -name "*.pub" -o -name "cert.pem" \) -exec chmod 644 {} + 2>/dev/null || true
+        find /etc/dnstm -type f \( -name "*.key" -o -name "server.key" \) -exec chmod 640 {} + 2>/dev/null || true
+        print_ok "Hardened /etc/dnstm ownership and permissions"
+    else
+        print_warn "/etc/dnstm not found yet; skipping file permission hardening"
+    fi
+
+    local dnstm_units
+    dnstm_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnstm-.*\.service$/ {print $1}' || true)
+    if [[ -z "$dnstm_units" ]]; then
+        print_warn "No dnstm systemd units found to harden"
+        return 0
+    fi
+
+    local unit
+    for unit in $dnstm_units; do
+        if [[ "$unit" == "dnstm-dnsrouter.service" ]]; then
+            write_service_override "$unit" "dnstm" "dnstm" "yes"
+        else
+            write_service_override "$unit" "dnstm" "dnstm" "no"
+        fi
+    done
+
+    if unit_exists "microsocks.service"; then
+        write_service_override "microsocks.service" "nobody" "nogroup" "no"
+    fi
+
+    systemctl daemon-reload
+
+    for unit in $dnstm_units microsocks.service; do
+        if ! unit_exists "$unit"; then
+            continue
+        fi
+        if systemctl is-enabled "$unit" &>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+            if ! systemctl restart "$unit" 2>/dev/null; then
+                print_fail "Failed to restart hardened unit: $unit"
+                return 1
+            fi
+        fi
+    done
+
+    enable_autostart_units
+    print_ok "Applied systemd hardening overrides"
+    return 0
+}
+
+do_harden() {
+    banner
+    print_header "Security Hardening Mode"
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root. Please run with: sudo bash $0 --harden"
+        exit 1
+    fi
+
+    configure_systemd_resolved_no_stub || true
+    apply_service_hardening
+
+    echo ""
+    print_info "Current unit users:"
+    for unit in dnstm-dnsrouter.service dnstm-dnstt1.service dnstm-slip1.service dnstm-dnstt-ssh.service dnstm-slip-ssh.service microsocks.service; do
+        if unit_exists "$unit"; then
+            systemctl show -p User -p Group "$unit" 2>/dev/null || true
+        fi
+    done
+    echo ""
+    print_ok "Hardening complete."
 }
 
 # ─── --uninstall ────────────────────────────────────────────────────────────────
@@ -617,22 +808,38 @@ do_uninstall() {
         print_ok "Removed /etc/dnstm"
     fi
 
+    # Remove systemd hardening overrides (if present)
+    find /etc/systemd/system -maxdepth 2 -type f -name '20-hardening.conf' -path '*/dnstm-*.service.d/*' -delete 2>/dev/null || true
+    rm -f /etc/systemd/system/microsocks.service.d/20-hardening.conf 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    print_ok "Removed local service hardening drop-ins"
+
+    # Remove resolver override used to free port 53
+    rm -f /etc/systemd/resolved.conf.d/10-dnstm-no-stub.conf 2>/dev/null || true
+
     # Unlock resolv.conf so the system can manage DNS again
     chattr -i /etc/resolv.conf 2>/dev/null || true
     print_ok "Removed immutable flag from /etc/resolv.conf"
+
+    systemctl unmask systemd-resolved.socket systemd-resolved.service 2>/dev/null || true
+    systemctl enable systemd-resolved.service 2>/dev/null || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+    if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    fi
+    print_ok "Restored systemd-resolved defaults (best effort)"
 
     echo ""
     print_ok "${GREEN}Uninstall complete.${NC}"
     echo ""
     print_warn "Note: DNS records in Cloudflare were NOT removed. Remove them manually if needed."
-    print_warn "Note: systemd-resolved was NOT re-enabled. Enable manually if needed:"
-    echo "         rm /etc/resolv.conf && ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
-    echo "         systemctl unmask systemd-resolved.socket systemd-resolved.service"
-    echo "         systemctl enable systemd-resolved && systemctl start systemd-resolved"
     echo ""
 }
 
 # ─── Parse Arguments ────────────────────────────────────────────────────────────
+
+ADD_DOMAIN_MODE=false
+HARDEN_ONLY_MODE=false
 
 case "${1:-}" in
     --help|-h)
@@ -650,9 +857,13 @@ case "${1:-}" in
     --add-domain)
         ADD_DOMAIN_MODE=true
         ;;
+    --harden)
+        HARDEN_ONLY_MODE=true
+        ;;
     "")
         # No args, continue with setup
         ADD_DOMAIN_MODE=false
+        HARDEN_ONLY_MODE=false
         ;;
     *)
         echo "Unknown option: $1"
@@ -822,32 +1033,19 @@ step_free_port53() {
     if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
         print_warn "systemd-resolved is occupying port 53"
         echo ""
-        if prompt_yn "Disable systemd-resolved to free port 53?" "y"; then
-            # Stop both the service and socket to prevent auto-restart
-            systemctl stop systemd-resolved.socket 2>/dev/null || true
-            systemctl stop systemd-resolved.service 2>/dev/null || true
-            systemctl disable systemd-resolved.socket 2>/dev/null || true
-            systemctl disable systemd-resolved.service 2>/dev/null || true
-            systemctl mask systemd-resolved.socket 2>/dev/null || true
-            systemctl mask systemd-resolved.service 2>/dev/null || true
+        if prompt_yn "Configure systemd-resolved to disable only DNSStubListener?" "y"; then
+            # Safer than masking resolved entirely: keep DNS management, only free :53.
+            configure_systemd_resolved_no_stub || true
             sleep 1
+            port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
 
-            # Kill any lingering process (belt and suspenders)
-            pkill -9 systemd-resolve 2>/dev/null || true
-            sleep 1
-
-            # Replace resolv.conf: must be a real file, not a symlink
-            # Remove immutable flag first (may be set from a previous run)
-            chattr -i /etc/resolv.conf 2>/dev/null || true
-            if [[ -L /etc/resolv.conf ]]; then
-                rm -f /etc/resolv.conf
+            # Fallback if stub is still present.
+            if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+                print_warn "systemd-resolved still occupies port 53; stopping service as fallback"
+                systemctl stop systemd-resolved.socket 2>/dev/null || true
+                systemctl stop systemd-resolved.service 2>/dev/null || true
+                sleep 1
             fi
-            echo "nameserver 8.8.8.8" > /etc/resolv.conf
-            # Prevent NetworkManager/systemd from overwriting it
-            chattr +i /etc/resolv.conf 2>/dev/null || true
-
-            print_ok "systemd-resolved fully disabled (service + socket)"
-            print_ok "Set DNS to 8.8.8.8 (resolv.conf locked)"
         else
             print_fail "Port 53 must be free for DNS tunnels to work."
             exit 1
@@ -960,10 +1158,8 @@ step_install_dnstm() {
     if [[ -s "$iptables_backup" ]]; then
         iptables-restore < "$iptables_backup" 2>/dev/null || true
     else
-        # No prior rules — ensure default policy is ACCEPT (not DROP)
-        iptables -P INPUT ACCEPT 2>/dev/null || true
-        iptables -P FORWARD ACCEPT 2>/dev/null || true
-        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+        # Do not force permissive policies if we don't have a valid snapshot.
+        print_warn "No iptables snapshot found; leaving existing firewall policy unchanged"
     fi
     rm -f "$iptables_backup"
 
@@ -993,14 +1189,17 @@ step_verify_port53() {
     local port53_output
     port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
 
-    # If systemd-resolved crept back, kill it again
+    # If systemd-resolved crept back to :53, switch it to no-stub mode.
     if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
-        print_warn "systemd-resolved came back — killing it again"
-        systemctl stop systemd-resolved.socket 2>/dev/null || true
-        systemctl stop systemd-resolved.service 2>/dev/null || true
-        systemctl mask systemd-resolved.socket 2>/dev/null || true
-        systemctl mask systemd-resolved.service 2>/dev/null || true
-        pkill -9 systemd-resolve 2>/dev/null || true
+        print_warn "systemd-resolved came back on :53 — reconfiguring stub listener"
+        configure_systemd_resolved_no_stub || true
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+        if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+            print_warn "systemd-resolved still occupies :53; stopping service as fallback"
+            systemctl stop systemd-resolved.socket 2>/dev/null || true
+            systemctl stop systemd-resolved.service 2>/dev/null || true
+        fi
         sleep 2
         port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
     fi
@@ -1020,10 +1219,12 @@ step_verify_port53() {
     # Firewall
     print_info "Ensuring firewall allows port 53..."
 
-    if command -v ufw &>/dev/null; then
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 53/tcp &>/dev/null || true
         ufw allow 53/udp &>/dev/null || true
         print_ok "ufw: port 53 TCP/UDP allowed"
+    elif command -v ufw &>/dev/null; then
+        print_info "ufw is installed but inactive; skipping ufw rule changes"
     fi
 
     if command -v iptables &>/dev/null; then
@@ -1216,6 +1417,12 @@ step_start_services() {
     echo ""
     dnstm tunnel list 2>/dev/null || print_warn "Could not get tunnel list"
     echo ""
+
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnstm and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnstm units"
+    fi
 }
 
 # ─── STEP 9: Verify microsocks ─────────────────────────────────────────────────
@@ -1789,6 +1996,12 @@ do_add_domain() {
     dnstm tunnel list 2>/dev/null || true
     echo ""
 
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnstm and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnstm units"
+    fi
+
     # Summary
     local w=54
     local border empty
@@ -1852,7 +2065,9 @@ main() {
     unset SSH_PASS 2>/dev/null || true
 }
 
-if [[ "$ADD_DOMAIN_MODE" == true ]]; then
+if [[ "$HARDEN_ONLY_MODE" == true ]]; then
+    do_harden
+elif [[ "$ADD_DOMAIN_MODE" == true ]]; then
     do_add_domain
 else
     main
