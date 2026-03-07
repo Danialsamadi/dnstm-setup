@@ -545,6 +545,21 @@ show_about() {
 
 # ─── Security Hardening Helpers ────────────────────────────────────────────────
 
+ensure_resolv_conf_fallback() {
+    # After stopping systemd-resolved, /etc/resolv.conf may still point to
+    # 127.0.0.53 which is now dead.  Write a temporary fallback so the script
+    # can still resolve hostnames (e.g. github.com for downloads).
+    if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+        print_info "Updating /etc/resolv.conf with public DNS fallback"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf <<'RESOLVEOF'
+# Temporary fallback written by dnstm-setup (systemd-resolved was stopped)
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+RESOLVEOF
+    fi
+}
+
 configure_systemd_resolved_no_stub() {
     # Keep system DNS working while freeing port 53 from the local stub listener.
     if ! command -v systemctl &>/dev/null; then
@@ -552,7 +567,7 @@ configure_systemd_resolved_no_stub() {
         return 0
     fi
 
-    if ! systemctl list-unit-files --type=service 2>/dev/null | grep -q '^systemd-resolved\.service'; then
+    if ! systemctl cat systemd-resolved.service &>/dev/null; then
         print_warn "systemd-resolved is not installed; skipping resolver hardening"
         return 0
     fi
@@ -1044,6 +1059,7 @@ step_free_port53() {
                 print_warn "systemd-resolved still occupies port 53; stopping service as fallback"
                 systemctl stop systemd-resolved.socket 2>/dev/null || true
                 systemctl stop systemd-resolved.service 2>/dev/null || true
+                ensure_resolv_conf_fallback
                 sleep 1
             fi
         else
@@ -1204,6 +1220,7 @@ step_verify_port53() {
             print_warn "systemd-resolved still occupies :53; stopping service as fallback"
             systemctl stop systemd-resolved.socket 2>/dev/null || true
             systemctl stop systemd-resolved.service 2>/dev/null || true
+            ensure_resolv_conf_fallback
         fi
         sleep 2
         port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
