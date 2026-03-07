@@ -1013,7 +1013,7 @@ step_free_port53() {
     print_step 4 "Free Port 53"
 
     local port53_output
-    port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
 
     if [[ -z "$port53_output" ]]; then
         print_ok "Port 53 is free"
@@ -1037,7 +1037,7 @@ step_free_port53() {
             # Safer than masking resolved entirely: keep DNS management, only free :53.
             configure_systemd_resolved_no_stub || true
             sleep 1
-            port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+            port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
 
             # Fallback if stub is still present.
             if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
@@ -1057,7 +1057,7 @@ step_free_port53() {
     fi
 
     # Verify port is now free
-    port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
     if [[ -z "$port53_output" ]]; then
         print_ok "Port 53 is now free"
     else
@@ -1124,6 +1124,11 @@ step_install_dnstm() {
     # Kill the dnstm binary itself (comm name = "dnstm", won't match "bash dnstm-setup.sh")
     pkill -9 -x dnstm 2>/dev/null || true
     sleep 1
+    # Reset systemd failed state before removing binary to prevent start-limit-hit
+    for unit in $(systemctl list-units --all --type=service --no-legend 'dnstm-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+    done
+    systemctl reset-failed dnstm-dnsrouter 2>/dev/null || true
     rm -f /usr/local/bin/dnstm
 
     # Download binary
@@ -1187,21 +1192,21 @@ step_verify_port53() {
     print_step 6 "Verify Port 53"
 
     local port53_output
-    port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
 
     # If systemd-resolved crept back to :53, switch it to no-stub mode.
     if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
         print_warn "systemd-resolved came back on :53 — reconfiguring stub listener"
         configure_systemd_resolved_no_stub || true
         sleep 2
-        port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
         if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
             print_warn "systemd-resolved still occupies :53; stopping service as fallback"
             systemctl stop systemd-resolved.socket 2>/dev/null || true
             systemctl stop systemd-resolved.service 2>/dev/null || true
         fi
         sleep 2
-        port53_output=$(ss -ulnp 2>/dev/null | grep ':53 ' || true)
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
     fi
 
     if echo "$port53_output" | grep -q "dnstm"; then
@@ -1364,7 +1369,7 @@ step_start_services() {
         local max_attempts=10
         while [[ $attempts -lt $max_attempts ]]; do
             sleep 1
-            if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q "dnstm"; then
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnstm"; then
                 print_ok "DNS Router confirmed on port 53"
                 break
             fi
@@ -1376,13 +1381,13 @@ step_start_services() {
         fi
     else
         # No changes — just verify router is running
-        if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q "dnstm"; then
+        if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnstm"; then
             print_ok "DNS Router already running on port 53 (no restart needed)"
         else
             print_warn "DNS Router not detected on port 53. Attempting start..."
             dnstm router start 2>/dev/null || true
             sleep 2
-            if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q "dnstm"; then
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnstm"; then
                 print_ok "DNS Router started on port 53"
             else
                 print_fail "DNS Router failed to start. Check: dnstm router logs"
@@ -1649,7 +1654,7 @@ step_tests() {
 
     # Test 4: Port 53
     echo -e "  ${BOLD}Test 4: Port 53${NC}"
-    if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q "dnstm"; then
+    if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnstm"; then
         print_ok "Port 53: PASS (dnstm listening)"
         pass=$((pass + 1))
     else
