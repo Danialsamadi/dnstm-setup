@@ -1908,88 +1908,6 @@ SOCKS_PASS=""
 SOCKS_AUTH=false
 TUNNELS_CHANGED=false
 
-# ─── Parse Arguments ────────────────────────────────────────────────────────────
-
-ADD_DOMAIN_MODE=false
-HARDEN_ONLY_MODE=false
-MANAGE_USERS_MODE=false
-DNSTT_MTU=1232
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --help|-h)
-            show_help
-            exit 0
-            ;;
-        --about)
-            show_about
-            exit 0
-            ;;
-        --status)
-            do_status
-            exit 0
-            ;;
-        --manage)
-            do_manage
-            exit 0
-            ;;
-        --uninstall)
-            do_uninstall
-            exit 0
-            ;;
-        --remove-tunnel)
-            # If $2 looks like another flag (starts with --), treat as no tag given
-            if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then
-                do_remove_tunnel "$2"
-            else
-                do_remove_tunnel ""
-            fi
-            exit 0
-            ;;
-        --add-tunnel)
-            do_add_tunnel
-            exit 0
-            ;;
-        --add-domain)
-            ADD_DOMAIN_MODE=true
-            shift
-            ;;
-        --users)
-            MANAGE_USERS_MODE=true
-            shift
-            ;;
-        --harden)
-            HARDEN_ONLY_MODE=true
-            shift
-            ;;
-        --mtu)
-            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 1400 ]]; then
-                DNSTT_MTU="$2"
-                shift 2
-            else
-                echo "Error: --mtu requires a value between 512 and 1400"
-                exit 1
-            fi
-            ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Use --help for usage information."
-            exit 1
-            ;;
-    esac
-done
-
-# ─── Validate conflicting flags ──────────────────────────────────────────────────
-
-mode_count=0
-[[ "$ADD_DOMAIN_MODE" == true ]] && ((mode_count++))
-[[ "$HARDEN_ONLY_MODE" == true ]] && ((mode_count++))
-[[ "$MANAGE_USERS_MODE" == true ]] && ((mode_count++))
-if [[ $mode_count -gt 1 ]]; then
-    echo "Error: --add-domain, --harden, and --users cannot be combined."
-    exit 1
-fi
-
 # ─── Variables (populated during setup) ─────────────────────────────────────────
 
 SSH_SETUP_DONE=false
@@ -2964,9 +2882,16 @@ step_summary() {
     echo ""
 
     if [[ -n "$DNSTT_PUBKEY" ]]; then
-        echo -e "  ${BOLD}DNSTT Public Key${NC}"
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
         echo -e "  ${DIM}────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+        echo -e "  ${GREEN}dnstt1 (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f /etc/dnstm/tunnels/dnstt-ssh/server.pub ]]; then
+            _dnstt_ssh_pk=$(cat /etc/dnstm/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}dnstt-ssh (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
         echo ""
     fi
 
@@ -3011,8 +2936,13 @@ step_summary() {
     if [[ "$SSH_SETUP_DONE" == true && -n "$SSH_USER" && -n "$SSH_PASS" ]]; then
         slipnet_url=$(generate_slipnet_url "slipstream_ssh" "s2" "" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
         echo -e "  ${GREEN}slip-ssh:${NC} ${slipnet_url}"
-        if [[ -n "$DNSTT_PUBKEY" ]]; then
-            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds2" "$DNSTT_PUBKEY" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+        # dnstt-ssh has its own keypair — read from its own tunnel dir
+        local dnstt_ssh_pubkey=""
+        if [[ -f /etc/dnstm/tunnels/dnstt-ssh/server.pub ]]; then
+            dnstt_ssh_pubkey=$(cat /etc/dnstm/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$dnstt_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds2" "$dnstt_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
             echo -e "  ${GREEN}dnstt-ssh:${NC} ${slipnet_url}"
         fi
     fi
@@ -3354,9 +3284,16 @@ do_add_domain() {
     echo ""
 
     if [[ -n "$DNSTT_PUBKEY" ]]; then
-        echo -e "  ${BOLD}DNSTT Public Key${NC}"
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
         echo -e "  ${DIM}────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+        echo -e "  ${GREEN}${dnstt_tag} (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f "/etc/dnstm/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+            _dnstt_ssh_pk=$(cat "/etc/dnstm/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${dnstt_ssh_tag} (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
         echo ""
     fi
 
@@ -3391,11 +3328,94 @@ do_add_domain() {
         slipnet_url=$(generate_slipnet_url "dnstt" "d2" "$DNSTT_PUBKEY" "" "" "$s_user" "$s_pass")
         echo -e "  ${GREEN}${dnstt_tag}:${NC}   ${slipnet_url}"
     fi
+    echo -e "  ${DIM}SSH tunnel slipnet:// URLs require credentials. Use --manage → Manage SSH users first.${NC}"
     echo ""
 
     echo -e "  ${DIM}To add more domains, run again: sudo bash $0 --add-domain${NC}"
     echo ""
 }
+
+# ─── Parse Arguments ────────────────────────────────────────────────────────────
+
+ADD_DOMAIN_MODE=false
+HARDEN_ONLY_MODE=false
+MANAGE_USERS_MODE=false
+DNSTT_MTU=1232
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --about)
+            show_about
+            exit 0
+            ;;
+        --status)
+            do_status
+            exit 0
+            ;;
+        --manage)
+            do_manage
+            exit 0
+            ;;
+        --uninstall)
+            do_uninstall
+            exit 0
+            ;;
+        --remove-tunnel)
+            # If $2 looks like another flag (starts with --), treat as no tag given
+            if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then
+                do_remove_tunnel "$2"
+            else
+                do_remove_tunnel ""
+            fi
+            exit 0
+            ;;
+        --add-tunnel)
+            do_add_tunnel
+            exit 0
+            ;;
+        --add-domain)
+            ADD_DOMAIN_MODE=true
+            shift
+            ;;
+        --users)
+            MANAGE_USERS_MODE=true
+            shift
+            ;;
+        --harden)
+            HARDEN_ONLY_MODE=true
+            shift
+            ;;
+        --mtu)
+            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 1400 ]]; then
+                DNSTT_MTU="$2"
+                shift 2
+            else
+                echo "Error: --mtu requires a value between 512 and 1400"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# ─── Validate conflicting flags ──────────────────────────────────────────────────
+
+mode_count=0
+[[ "$ADD_DOMAIN_MODE" == true ]] && ((mode_count++))
+[[ "$HARDEN_ONLY_MODE" == true ]] && ((mode_count++))
+[[ "$MANAGE_USERS_MODE" == true ]] && ((mode_count++))
+if [[ $mode_count -gt 1 ]]; then
+    echo "Error: --add-domain, --harden, and --users cannot be combined."
+    exit 1
+fi
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
