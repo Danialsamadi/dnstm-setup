@@ -937,6 +937,82 @@ generate_slipnet_url() {
     echo "slipnet://$(echo -n "$data" | base64 -w0)"
 }
 
+# ─── microsocks GLIBC Fix ─────────────────────────────────────────────────────
+
+compile_microsocks_from_source() {
+    # The pre-built microsocks binary shipped by dnstm requires GLIBC ≥ 2.38.
+    # Older distros (Ubuntu 22.04 = GLIBC 2.35, Debian 11 = 2.31) will fail to
+    # run it.  This function compiles microsocks from source as a fallback.
+    print_info "Compiling microsocks from source (GLIBC compatibility fix)..."
+
+    # Ensure build tools are available
+    if ! command -v gcc &>/dev/null || ! command -v make &>/dev/null; then
+        print_info "Installing build tools (gcc, make, git)..."
+        dpkg --configure -a 2>/dev/null || true
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq build-essential git 2>/dev/null || true
+    fi
+
+    if ! command -v gcc &>/dev/null; then
+        print_fail "Cannot install gcc — microsocks will not work"
+        return 1
+    fi
+
+    local build_dir="/tmp/microsocks-build-$$"
+    rm -rf "$build_dir"
+
+    if ! git clone --depth 1 https://github.com/rofl0r/microsocks.git "$build_dir" 2>/dev/null; then
+        print_fail "Failed to clone microsocks source"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if ! make -C "$build_dir" 2>/dev/null; then
+        print_fail "Failed to compile microsocks"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if [[ ! -f "$build_dir/microsocks" ]]; then
+        print_fail "microsocks binary not produced"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    # Replace the broken binary
+    systemctl stop microsocks 2>/dev/null || true
+    cp "$build_dir/microsocks" /usr/local/bin/microsocks
+    chmod +x /usr/local/bin/microsocks
+    rm -rf "$build_dir"
+
+    # Restart service
+    systemctl reset-failed microsocks 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    if systemctl start microsocks 2>/dev/null; then
+        sleep 2
+        if pgrep -x microsocks &>/dev/null; then
+            print_ok "microsocks compiled from source and running"
+            return 0
+        fi
+    fi
+
+    print_fail "microsocks compiled but failed to start"
+    return 1
+}
+
+# Check whether the microsocks binary can actually execute on this system.
+# Returns 0 if it works, 1 if GLIBC or another loader error is detected.
+microsocks_binary_works() {
+    local bin="${1:-/usr/local/bin/microsocks}"
+    [[ -x "$bin" ]] || return 1
+    # Use ldd to check for missing shared library versions.  GLIBC mismatches
+    # show "not found" in ldd output (e.g. "GLIBC_2.38 not found").
+    if ldd "$bin" 2>&1 | grep -qi "not found"; then
+        return 1
+    fi
+    return 0
+}
+
 # ─── Security Hardening Helpers ────────────────────────────────────────────────
 
 ensure_resolv_conf_fallback() {
@@ -2532,11 +2608,33 @@ step_verify_microsocks() {
 
         systemctl enable microsocks 2>/dev/null || true
         if systemctl start microsocks 2>/dev/null; then
-            print_ok "microsocks started"
-            microsocks_running=true
+            sleep 1
+            if pgrep -x microsocks &>/dev/null; then
+                print_ok "microsocks started"
+                microsocks_running=true
+            else
+                # May have crashed immediately — check for GLIBC issue
+                if ! microsocks_binary_works; then
+                    print_warn "microsocks crashed (GLIBC incompatibility detected)"
+                    if compile_microsocks_from_source; then
+                        microsocks_running=true
+                    fi
+                else
+                    print_fail "Failed to start microsocks"
+                    print_info "Check: systemctl status microsocks"
+                fi
+            fi
         else
-            print_fail "Failed to start microsocks"
-            print_info "Check: systemctl status microsocks"
+            # systemctl start failed — check for GLIBC issue
+            if ! microsocks_binary_works; then
+                print_warn "microsocks binary incompatible — compiling from source..."
+                if compile_microsocks_from_source; then
+                    microsocks_running=true
+                fi
+            else
+                print_fail "Failed to start microsocks"
+                print_info "Check: systemctl status microsocks"
+            fi
         fi
     fi
 
