@@ -1756,6 +1756,7 @@ do_manage_users() {
 
         # Run initial configure
         print_info "Applying SSH security configuration..."
+        mkdir -p /run/sshd 2>/dev/null || true
         if timeout 30 sshtun-user configure </dev/null 2>&1; then
             print_ok "SSH configuration applied"
         else
@@ -2798,6 +2799,7 @@ step_ssh_user() {
 
     # Configure SSH (only needed once)
     print_info "Applying SSH security configuration..."
+    mkdir -p /run/sshd 2>/dev/null || true
     local configure_output
     configure_output=$(timeout 30 sshtun-user configure </dev/null 2>&1) || true
     if echo "$configure_output" | grep -qi "already"; then
