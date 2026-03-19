@@ -1253,6 +1253,173 @@ apply_service_hardening() {
     return 0
 }
 
+# ─── Change MTU ──────────────────────────────────────────────────────────────────
+
+do_change_mtu() {
+    banner
+    print_header "Change DNSTT MTU"
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root."
+        exit 1
+    fi
+
+    if ! command -v dnstm &>/dev/null; then
+        print_fail "dnstm is not installed."
+        return 1
+    fi
+
+    # Find DNSTT tunnels from dnstm
+    local tunnel_output
+    tunnel_output=$(dnstm tunnel list 2>/dev/null || true)
+    if [[ -z "$tunnel_output" ]]; then
+        print_warn "No tunnels found."
+        return 0
+    fi
+
+    # Find DNSTT service files by looking for dnstt-server in ExecStart
+    local dnstt_svcs=()
+    local dnstt_tags=()
+    local svc_files
+    svc_files=$(find /etc/systemd/system -maxdepth 1 -name 'dnstm*.service' -o -name 'dnsrouter*.service' 2>/dev/null || true)
+    # Also check for dnstm tunnel list tag-based discovery
+    local all_tags
+    all_tags=$(echo "$tunnel_output" | grep -o 'tag=[^ ]*' | sed 's/tag=//' || true)
+
+    # Method 1: Find services containing dnstt-server in ExecStart
+    for svc_file in $svc_files; do
+        if grep -q 'dnstt-server\|dnstt' "$svc_file" 2>/dev/null; then
+            local svc_name
+            svc_name=$(basename "$svc_file")
+            local exec_line
+            exec_line=$(grep '^ExecStart=' "$svc_file" 2>/dev/null | tail -1 || true)
+            # Only include if it actually runs dnstt-server (not router)
+            if echo "$exec_line" | grep -q 'dnstt-server'; then
+                dnstt_svcs+=("$svc_name")
+                local tag_name
+                tag_name=$(echo "$svc_name" | sed 's/^dnstm-tunnel-//;s/^dnstm-//;s/\.service$//')
+                dnstt_tags+=("$tag_name")
+            fi
+        fi
+    done
+
+    # Method 2: If Method 1 found nothing, try from dnstm tunnel list
+    if [[ ${#dnstt_svcs[@]} -eq 0 ]]; then
+        for tag in $all_tags; do
+            # Skip noiz tunnels — they don't support MTU
+            if [[ "$tag" == noiz* ]]; then
+                continue
+            fi
+            if echo "$tunnel_output" | awk -v t="tag=${tag}" '{for(i=1;i<=NF;i++) if($i==t){print;next}}' | grep -qi "transport=dnstt"; then
+                # Try common service name patterns
+                local found_svc=""
+                for pattern in "dnstm-tunnel-${tag}.service" "dnstm-${tag}.service"; do
+                    if systemctl cat "$pattern" &>/dev/null; then
+                        # Verify it actually runs dnstt-server, not noiz
+                        if systemctl cat "$pattern" 2>/dev/null | grep -q 'dnstt-server'; then
+                            found_svc="$pattern"
+                            break
+                        fi
+                    fi
+                done
+                if [[ -n "$found_svc" ]]; then
+                    dnstt_svcs+=("$found_svc")
+                    dnstt_tags+=("$tag")
+                fi
+            fi
+        done
+    fi
+
+    if [[ ${#dnstt_svcs[@]} -eq 0 ]]; then
+        print_warn "No DNSTT tunnel services found. MTU only applies to DNSTT tunnels."
+        return 0
+    fi
+
+    # Show current MTU for each DNSTT tunnel
+    echo ""
+    print_info "Current DNSTT tunnels and MTU values:"
+    echo ""
+    local i
+    for i in "${!dnstt_svcs[@]}"; do
+        local svc="${dnstt_svcs[$i]}"
+        local tag="${dnstt_tags[$i]}"
+        local exec_line
+        exec_line=$(systemctl cat "$svc" 2>/dev/null | grep '^ExecStart=' | tail -1 || true)
+        local current_mtu
+        current_mtu=$(echo "$exec_line" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+        if [[ -z "$current_mtu" ]]; then
+            current_mtu="default (1232)"
+        fi
+        echo -e "  ${BOLD}${tag}${NC}: MTU = ${GREEN}${current_mtu}${NC}  ${DIM}(${svc})${NC}"
+    done
+
+    echo ""
+    local new_mtu
+    new_mtu=$(prompt_input "Enter new MTU value for ALL DNSTT tunnels (512-1400)" "1100")
+    new_mtu=$(echo "$new_mtu" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || [[ "$new_mtu" -lt 512 ]] || [[ "$new_mtu" -gt 1400 ]]; then
+        print_fail "Invalid MTU value. Must be 512-1400."
+        return 1
+    fi
+
+    echo ""
+    print_info "Setting MTU to ${new_mtu} on all DNSTT tunnels..."
+
+    local changed=0
+    for i in "${!dnstt_svcs[@]}"; do
+        local svc="${dnstt_svcs[$i]}"
+        local tag="${dnstt_tags[$i]}"
+        local exec_line
+        exec_line=$(systemctl cat "$svc" 2>/dev/null | grep '^ExecStart=' | tail -1 || true)
+        if [[ -z "$exec_line" ]]; then
+            print_warn "Could not read ExecStart for ${tag}, skipping"
+            continue
+        fi
+
+        local new_exec
+        if echo "$exec_line" | grep -qE '\-mtu\s+[0-9]+'; then
+            # Replace existing MTU
+            new_exec=$(echo "$exec_line" | sed -E "s/-mtu\s+[0-9]+/-mtu ${new_mtu}/")
+        else
+            # Add MTU after -udp :PORT
+            new_exec=$(echo "$exec_line" | sed -E "s/(-udp\s+:[0-9]+)/\1 -mtu ${new_mtu}/")
+        fi
+
+        # Write override
+        local override_dir="/etc/systemd/system/${svc}.d"
+        mkdir -p "$override_dir"
+        cat > "${override_dir}/mtu-override.conf" <<MTEOF
+[Service]
+ExecStart=
+${new_exec}
+MTEOF
+
+        print_ok "${tag}: MTU → ${new_mtu}"
+        ((changed++)) || true
+    done
+
+    if [[ $changed -gt 0 ]]; then
+        systemctl daemon-reload
+        echo ""
+        print_info "Restarting DNSTT tunnels..."
+        for svc in "${dnstt_svcs[@]}"; do
+            systemctl restart "$svc" 2>/dev/null || true
+        done
+        sleep 2
+        # Restart router to pick up changes
+        if systemctl is-active dnstm-router &>/dev/null; then
+            systemctl restart dnstm-router 2>/dev/null || true
+        fi
+        echo ""
+        print_ok "MTU updated to ${new_mtu} on ${changed} tunnel(s). Keys unchanged."
+    else
+        print_warn "No tunnels were modified."
+    fi
+}
+
+# ─── --harden ────────────────────────────────────────────────────────────────────
+
 do_harden() {
     banner
     print_header "Security Hardening Mode"
@@ -3213,15 +3380,16 @@ do_manage() {
         echo -e "  ${BOLD}6)${NC}  Configure SOCKS auth  ${DIM}(enable, disable, or change credentials)${NC}"
         echo -e "  ${BOLD}7)${NC}  Apply hardening       ${DIM}(systemd security for all services)${NC}"
         echo -e "  ${BOLD}8)${NC}  Xray backend          ${DIM}(connect 3x-ui panel via DNS tunnel)${NC}"
+        echo -e "  ${BOLD}9)${NC}  Change DNSTT MTU      ${DIM}(change MTU on existing DNSTT tunnels)${NC}"
         echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
-        echo -e "  ${BOLD}${RED}9)${NC}  ${RED}Uninstall everything${NC}"
+        echo -e "  ${BOLD}${RED}10)${NC} ${RED}Uninstall everything${NC}"
         echo ""
         echo -e "  ${BOLD}0)${NC}  Exit"
         echo ""
 
         local choice=""
-        read -rp "  Select [0-9]: " choice || break
+        read -rp "  Select [0-10]: " choice || break
 
         case "$choice" in
             1)
@@ -3249,6 +3417,9 @@ do_manage() {
                 ( trap - INT; do_add_xray ) || true
                 ;;
             9)
+                ( trap - INT; do_change_mtu ) || true
+                ;;
+            10)
                 ( trap - INT; do_uninstall ) || true
                 # If uninstall succeeded, dnstm is gone — exit menu
                 hash -d dnstm 2>/dev/null || true
@@ -3267,7 +3438,7 @@ do_manage() {
                 continue
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-9."
+                print_warn "Invalid choice. Enter 0-10."
                 sleep 1
                 continue
                 ;;
