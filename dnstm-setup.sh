@@ -13,6 +13,22 @@ set -euo pipefail
 VERSION="1.3"
 TOTAL_STEPS=12
 
+# ─── Safety: ensure DNS is never left broken on exit ──────────────────────────
+
+_dnstm_cleanup_dns() {
+    # If resolv.conf is empty, missing, or points only at a dead stub, fix it.
+    if [[ ! -s /etc/resolv.conf ]] || \
+       ( grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null && \
+         ! ss -ulnp 2>/dev/null | grep -q '127\.0\.0\.53.*systemd-resolve' ); then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf 2>/dev/null <<'DNSEOF' || true
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+    fi
+}
+trap '_dnstm_cleanup_dns' EXIT
+
 # ─── Colors & Formatting ───────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -996,13 +1012,40 @@ compile_microsocks_from_source() {
     # Ensure build tools are available
     if ! command -v gcc &>/dev/null || ! command -v make &>/dev/null; then
         print_info "Installing build tools (gcc, make, git)..."
+
+        # Wait for any running apt/dpkg lock (unattended-upgrades, etc.)
+        local lock_wait=0
+        while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || \
+              fuser /var/lib/apt/lists/lock &>/dev/null 2>&1 || \
+              fuser /var/lib/dpkg/lock &>/dev/null 2>&1; do
+            if [[ $lock_wait -eq 0 ]]; then
+                print_info "Waiting for package manager lock (another process is running)..."
+            fi
+            sleep 2
+            lock_wait=$((lock_wait + 2))
+            if [[ $lock_wait -ge 60 ]]; then
+                print_warn "Package manager still locked after 60s — killing blocking process"
+                # Kill unattended-upgrades if it's the blocker
+                pkill -f unattended-upgr 2>/dev/null || true
+                sleep 3
+                dpkg --configure -a 2>/dev/null || true
+                break
+            fi
+        done
+
         dpkg --configure -a 2>/dev/null || true
         apt-get update -qq 2>/dev/null || true
-        apt-get install -y -qq build-essential git 2>/dev/null || true
+        if ! apt-get install -y -qq build-essential git 2>/dev/null; then
+            # Retry once after clearing locks
+            sleep 2
+            dpkg --configure -a 2>/dev/null || true
+            apt-get install -y -qq build-essential git 2>/dev/null || true
+        fi
     fi
 
     if ! command -v gcc &>/dev/null; then
         print_fail "Cannot install gcc — microsocks will not work"
+        print_info "Try manually: apt install -y build-essential && re-run this script"
         return 1
     fi
 
@@ -1065,16 +1108,23 @@ microsocks_binary_works() {
 
 ensure_resolv_conf_fallback() {
     # After stopping systemd-resolved, /etc/resolv.conf may still point to
-    # 127.0.0.53 which is now dead.  Write a temporary fallback so the script
-    # can still resolve hostnames (e.g. github.com for downloads).
-    if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+    # 127.0.0.53 which is now dead.  Write a fallback and lock it so nothing
+    # (package manager, resolved restart) can overwrite it.
+    if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null || \
+       [[ ! -s /etc/resolv.conf ]]; then
         print_info "Updating /etc/resolv.conf with public DNS fallback"
         chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf 2>/dev/null || true
         cat > /etc/resolv.conf <<'RESOLVEOF'
-# Temporary fallback written by dnstm-setup (systemd-resolved was stopped)
 nameserver 8.8.8.8
 nameserver 1.1.1.1
 RESOLVEOF
+        # Verify the write succeeded
+        if ! grep -q '8\.8\.8\.8' /etc/resolv.conf 2>/dev/null; then
+            echo "nameserver 8.8.8.8" > /etc/resolv.conf 2>/dev/null || true
+        fi
+        # Lock so systemd-resolved or package manager can't overwrite
+        chattr +i /etc/resolv.conf 2>/dev/null || true
     fi
 }
 
@@ -1094,20 +1144,35 @@ configure_systemd_resolved_no_stub() {
     cat > /etc/systemd/resolved.conf.d/10-dnstm-no-stub.conf <<'EOF'
 [Resolve]
 DNSStubListener=no
+DNS=8.8.8.8 1.1.1.1
 EOF
 
-    # If a previous run locked resolv.conf, unlock it before relinking.
+    # Unlock resolv.conf, write direct nameservers (NOT a symlink to resolved),
+    # then lock it so nothing (package manager, resolved restart) can overwrite it.
     chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf 2>/dev/null || true
+    cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+    chattr +i /etc/resolv.conf 2>/dev/null || true
 
     systemctl unmask systemd-resolved.service systemd-resolved.socket 2>/dev/null || true
     systemctl enable systemd-resolved.service 2>/dev/null || true
-    if ! systemctl restart systemd-resolved.service 2>/dev/null; then
-        print_warn "Could not restart systemd-resolved; keeping current resolver setup"
-        return 1
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+
+    # Verify DNS actually works
+    sleep 1
+    local dns_ok=false
+    if getent hosts github.com &>/dev/null 2>&1; then
+        dns_ok=true
+    elif curl -sf --max-time 3 https://api.ipify.org &>/dev/null 2>&1; then
+        dns_ok=true
     fi
 
-    if [[ -e /run/systemd/resolve/resolv.conf ]]; then
-        ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf || true
+    if [[ "$dns_ok" != "true" ]]; then
+        print_warn "DNS not working — check /etc/resolv.conf"
+        return 1
     fi
 
     return 0
@@ -1620,7 +1685,7 @@ do_add_tunnel() {
     echo ""
 
     # Detect server IP
-    SERVER_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
     if [[ -n "$SERVER_IP" ]]; then
         print_ok "Server IP: ${SERVER_IP}"
     fi
@@ -1950,8 +2015,19 @@ do_uninstall() {
     systemctl unmask systemd-resolved.socket systemd-resolved.service 2>/dev/null || true
     systemctl enable systemd-resolved.service 2>/dev/null || true
     systemctl restart systemd-resolved.service 2>/dev/null || true
+    sleep 1
     if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
         ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+    fi
+    # Ensure DNS works after uninstall — if resolv.conf is broken, write fallback
+    if ! getent hosts google.com >/dev/null 2>&1 && \
+       ! curl -sf --max-time 3 https://api.ipify.org >/dev/null 2>&1; then
+        print_warn "DNS not working after restore — writing fallback nameservers"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
     fi
     print_ok "Restored systemd-resolved defaults (best effort)"
 
@@ -2019,10 +2095,22 @@ do_manage_users() {
         # Run initial configure
         print_info "Applying SSH security configuration..."
         mkdir -p /run/sshd 2>/dev/null || true
+        # Back up sshd_config before modification
+        if [[ -f /etc/ssh/sshd_config ]]; then
+            cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.dnstm-backup 2>/dev/null || true
+        fi
         if timeout 30 sshtun-user configure </dev/null 2>&1; then
             print_ok "SSH configuration applied"
         else
             print_warn "SSH configuration may not have applied fully — user management may have issues"
+        fi
+        # Validate sshd_config — rollback if broken
+        if command -v sshd &>/dev/null && ! sshd -t 2>/dev/null; then
+            print_warn "sshd_config validation failed — rolling back"
+            if [[ -f /etc/ssh/sshd_config.dnstm-backup ]]; then
+                cp -f /etc/ssh/sshd_config.dnstm-backup /etc/ssh/sshd_config
+                print_ok "Restored sshd_config from backup"
+            fi
         fi
         echo ""
     fi
@@ -2257,48 +2345,59 @@ install_3xui() {
     fi
     print_ok "3x-ui installed and running"
 
-    # Set custom credentials and port via database
+    # Set custom credentials and port
     # IMPORTANT: if setting fails, we must output the ACTUAL values so the caller
     # uses correct credentials for the API (avoids mismatch)
     INSTALL_3XUI_ACTUAL_USER="$admin_user"
     INSTALL_3XUI_ACTUAL_PASS="$admin_pass"
     INSTALL_3XUI_ACTUAL_PORT="$panel_port"
 
-    if command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
-        # Escape single quotes for SQL safety (replace ' with '')
+    # --- Set credentials ---
+    # Prefer x-ui binary (handles password hashing for v2.0+)
+    local creds_set=false
+    if [[ -x /usr/local/x-ui/x-ui ]]; then
+        if /usr/local/x-ui/x-ui setting -username "$admin_user" -password "$admin_pass" &>/dev/null; then
+            print_ok "Set panel credentials: ${admin_user}"
+            creds_set=true
+        fi
+    fi
+    # Fallback to sqlite3 for older versions without the binary setting command
+    if [[ "$creds_set" != "true" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
         local sql_user="${admin_user//\'/\'\'}"
         local sql_pass="${admin_pass//\'/\'\'}"
-
         if echo "UPDATE users SET username='${sql_user}', password='${sql_pass}' WHERE id=1;" | sqlite3 /etc/x-ui/x-ui.db 2>/dev/null; then
-            print_ok "Set panel credentials: ${admin_user}"
-        else
-            print_warn "Could not set custom credentials. Using defaults: admin/admin"
-            INSTALL_3XUI_ACTUAL_USER="admin"
-            INSTALL_3XUI_ACTUAL_PASS="admin"
+            print_ok "Set panel credentials: ${admin_user} (via database)"
+            creds_set=true
         fi
+    fi
+    if [[ "$creds_set" != "true" ]]; then
+        print_warn "Could not set custom credentials. Using defaults: admin/admin"
+        INSTALL_3XUI_ACTUAL_USER="admin"
+        INSTALL_3XUI_ACTUAL_PASS="admin"
+    fi
 
-        # Set panel port (already validated as numeric, no injection risk)
+    # --- Set panel port ---
+    local port_set=false
+    # Try x-ui binary first
+    if [[ -x /usr/local/x-ui/x-ui ]]; then
+        if /usr/local/x-ui/x-ui setting -port "$panel_port" &>/dev/null; then
+            print_ok "Set panel port: ${panel_port}"
+            port_set=true
+        fi
+    fi
+    # Fallback to sqlite3
+    if [[ "$port_set" != "true" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
         local existing
         existing=$(sqlite3 /etc/x-ui/x-ui.db "SELECT COUNT(*) FROM settings WHERE key='webPort'" 2>/dev/null || echo "0")
         if [[ "$existing" -gt 0 ]]; then
-            if sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='${panel_port}' WHERE key='webPort'" 2>/dev/null; then
-                print_ok "Set panel port: ${panel_port}"
-            else
-                print_warn "Could not set panel port. Using default: 2053"
-                INSTALL_3XUI_ACTUAL_PORT="2053"
-            fi
+            sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='${panel_port}' WHERE key='webPort'" 2>/dev/null && port_set=true
         else
-            if sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key, value) VALUES ('webPort', '${panel_port}')" 2>/dev/null; then
-                print_ok "Set panel port: ${panel_port}"
-            else
-                print_warn "Could not set panel port. Using default: 2053"
-                INSTALL_3XUI_ACTUAL_PORT="2053"
-            fi
+            sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key, value) VALUES ('webPort', '${panel_port}')" 2>/dev/null && port_set=true
         fi
-    else
-        print_warn "Could not set custom credentials (sqlite3 not available). Using defaults: admin/admin, port 2053"
-        INSTALL_3XUI_ACTUAL_USER="admin"
-        INSTALL_3XUI_ACTUAL_PASS="admin"
+        [[ "$port_set" == "true" ]] && print_ok "Set panel port: ${panel_port}"
+    fi
+    if [[ "$port_set" != "true" ]]; then
+        print_warn "Could not set panel port. Using default: 2053"
         INSTALL_3XUI_ACTUAL_PORT="2053"
     fi
 
@@ -2557,9 +2656,11 @@ get_3xui_credentials() {
     XRAY_ADMIN_PASS=""
 
     # Try to read from database
-    if command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
-        XRAY_ADMIN_USER=$(sqlite3 /etc/x-ui/x-ui.db "SELECT username FROM users LIMIT 1" 2>/dev/null || true)
-        XRAY_ADMIN_PASS=$(sqlite3 /etc/x-ui/x-ui.db "SELECT password FROM users LIMIT 1" 2>/dev/null || true)
+    if [[ -z "$XRAY_ADMIN_USER" || -z "$XRAY_ADMIN_PASS" ]]; then
+        if command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
+            XRAY_ADMIN_USER=$(sqlite3 /etc/x-ui/x-ui.db "SELECT username FROM users LIMIT 1" 2>/dev/null || true)
+            XRAY_ADMIN_PASS=$(sqlite3 /etc/x-ui/x-ui.db "SELECT password FROM users LIMIT 1" 2>/dev/null || true)
+        fi
     fi
 
     # Detect bcrypt-hashed passwords (3x-ui v2.0+ hashes by default)
@@ -2696,7 +2797,8 @@ create_3xui_inbound() {
             --data-urlencode "username=${XRAY_ADMIN_USER}" \
             --data-urlencode "password=${XRAY_ADMIN_PASS}" \
             --max-time 5 2>/dev/null || true)
-        if [[ -n "$login_resp" ]]; then
+        # Only accept JSON responses (not HTML error pages or empty)
+        if [[ -n "$login_resp" ]] && echo "$login_resp" | jq . &>/dev/null; then
             panel_url="$try_url"
             break
         fi
@@ -2704,7 +2806,7 @@ create_3xui_inbound() {
         : > "$cookie_jar"
     done
 
-    if [[ -z "$login_resp" ]]; then
+    if [[ -z "$panel_url" ]]; then
         print_fail "Could not connect to 3x-ui panel on port ${XRAY_PANEL_PORT}"
         print_info "Is the panel running? Check: systemctl status x-ui"
         print_info "If your panel has a custom base path, check: sqlite3 /etc/x-ui/x-ui.db \"SELECT value FROM settings WHERE key='webBasePath'\""
@@ -2994,10 +3096,13 @@ ensure_noizdns_binary() {
     [[ "$noizdns_arch" == "armv7" ]] && noizdns_arch="arm"
 
     local noizdns_downloaded=false
+    local noizdns_own_url="https://github.com/SamNet-dev/dnstm-setup/releases/download/noizdns-v1.0/noizdns-server-linux-${noizdns_arch}"
     local noizdns_release_url="https://github.com/anonvector/noizdns-deploy/releases/latest/download/dnstt-server-linux-${noizdns_arch}"
     local noizdns_raw_url="https://raw.githubusercontent.com/anonvector/noizdns-deploy/main/bin/dnstt-server-linux-${noizdns_arch}"
 
-    if curl -fsSL -o /usr/local/bin/noizdns-server "$noizdns_release_url" 2>/dev/null; then
+    if curl -fsSL -o /usr/local/bin/noizdns-server "$noizdns_own_url" 2>/dev/null; then
+        noizdns_downloaded=true
+    elif curl -fsSL -o /usr/local/bin/noizdns-server "$noizdns_release_url" 2>/dev/null; then
         noizdns_downloaded=true
     elif curl -fsSL -o /usr/local/bin/noizdns-server "$noizdns_raw_url" 2>/dev/null; then
         noizdns_downloaded=true
@@ -3009,11 +3114,15 @@ ensure_noizdns_binary() {
             print_warn "NoizDNS binary is empty (download may have failed)"
             rm -f /usr/local/bin/noizdns-server
             return 1
-        elif timeout 3 /usr/local/bin/noizdns-server -help 2>&1 | grep -qi "usage\|flag\|dnstt\|privkey"; then
+        fi
+        # Validate: must be an ELF binary for this architecture
+        local file_type
+        file_type=$(file /usr/local/bin/noizdns-server 2>/dev/null || true)
+        if echo "$file_type" | grep -qi "ELF.*executable"; then
             print_ok "NoizDNS server installed and verified"
             return 0
         else
-            print_warn "NoizDNS binary downloaded but may be corrupt or wrong architecture"
+            print_warn "NoizDNS binary is not a valid executable (got: ${file_type})"
             rm -f /usr/local/bin/noizdns-server
             return 1
         fi
@@ -3142,7 +3251,7 @@ do_add_xray() {
     fi
 
     # Detect server IP
-    SERVER_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
     if [[ -n "$SERVER_IP" ]]; then
         print_ok "Server IP: ${SERVER_IP}"
     else
@@ -3583,6 +3692,11 @@ step_preflight() {
         exit 1
     fi
 
+    # Back up resolv.conf so we can always recover DNS
+    if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.dnstm-backup ]]; then
+        cp -f /etc/resolv.conf /etc/resolv.conf.dnstm-backup 2>/dev/null || true
+    fi
+
     # Check OS (read in subshell to avoid overwriting script's VERSION variable)
     if [[ -f /etc/os-release ]]; then
         local os_id os_name
@@ -3617,8 +3731,21 @@ step_preflight() {
         fi
     fi
 
+    # Ensure DNS resolution works (may be broken after previous uninstall)
+    if ! curl -4 -s --max-time 3 https://api.ipify.org >/dev/null 2>&1; then
+        if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+            # systemd-resolved stub is dead — replace with public DNS
+            print_warn "DNS broken (stub listener dead) — fixing resolv.conf"
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+        fi
+    fi
+
     # Detect server IP
-    SERVER_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
     if [[ -n "$SERVER_IP" ]]; then
         print_ok "Server IP: ${SERVER_IP}"
     else
@@ -3669,6 +3796,17 @@ cloudflare_create_dns_records() {
     local domain="$2"
     local server_ip="$3"
     local cf_api="https://api.cloudflare.com/client/v4"
+
+    # Ensure jq is installed (needed for JSON parsing)
+    if ! command -v jq &>/dev/null; then
+        print_info "Installing jq (needed for Cloudflare API)..."
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq jq >/dev/null 2>&1 || true
+        if ! command -v jq &>/dev/null; then
+            print_fail "Could not install jq. Install manually: apt-get install jq"
+            return 1
+        fi
+    fi
 
     # Step 1: Get Zone ID
     print_info "Looking up Cloudflare Zone ID for ${domain}..."
@@ -3804,6 +3942,17 @@ step_dns_records() {
             exit 1
         fi
 
+        # Ensure jq is installed (needed for API JSON parsing)
+        if ! command -v jq &>/dev/null; then
+            print_info "Installing jq (needed for Cloudflare API)..."
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq jq >/dev/null 2>&1 || true
+            if ! command -v jq &>/dev/null; then
+                print_fail "Could not install jq. Install manually: apt-get install jq"
+                exit 1
+            fi
+        fi
+
         # Validate token
         print_info "Validating API token..."
         local verify_resp
@@ -3902,9 +4051,10 @@ step_free_port53() {
 
             # Fallback if stub is still present.
             if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
-                print_warn "systemd-resolved still occupies port 53; stopping service as fallback"
+                print_warn "systemd-resolved still occupies port 53; stopping + disabling as fallback"
                 systemctl stop systemd-resolved.socket 2>/dev/null || true
                 systemctl stop systemd-resolved.service 2>/dev/null || true
+                systemctl disable systemd-resolved.service 2>/dev/null || true
                 ensure_resolv_conf_fallback
                 sleep 1
             fi
@@ -4049,6 +4199,14 @@ step_install_dnstm() {
     echo "    - DNS Router service"
     echo "    - microsocks SOCKS5 proxy"
 
+    # Proactive GLIBC check — compile microsocks from source now if needed,
+    # so it's ready by the time step 9 verifies the proxy.
+    if ! microsocks_binary_works; then
+        echo ""
+        print_warn "microsocks binary incompatible with this system — compiling from source..."
+        compile_microsocks_from_source || print_warn "microsocks compilation failed — will retry in step 9"
+    fi
+
     # Download NoizDNS server binary (DPI-resistant DNSTT fork)
     echo ""
     ensure_noizdns_binary || true
@@ -4069,9 +4227,10 @@ step_verify_port53() {
         sleep 2
         port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
         if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
-            print_warn "systemd-resolved still occupies :53; stopping service as fallback"
+            print_warn "systemd-resolved still occupies :53; stopping + disabling as fallback"
             systemctl stop systemd-resolved.socket 2>/dev/null || true
             systemctl stop systemd-resolved.service 2>/dev/null || true
+            systemctl disable systemd-resolved.service 2>/dev/null || true
             ensure_resolv_conf_fallback
         fi
         sleep 2
@@ -4599,6 +4758,12 @@ step_ssh_user() {
     # Configure SSH (only needed once)
     print_info "Applying SSH security configuration..."
     mkdir -p /run/sshd 2>/dev/null || true
+
+    # Back up sshd_config before any modification
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.dnstm-backup 2>/dev/null || true
+    fi
+
     local configure_output
     configure_output=$(timeout 30 sshtun-user configure </dev/null 2>&1) || true
     if echo "$configure_output" | grep -qi "already"; then
@@ -4608,6 +4773,15 @@ step_ssh_user() {
         echo -e "  ${DIM}${configure_output}${NC}"
     else
         print_ok "SSH configuration applied"
+    fi
+
+    # Validate sshd_config — rollback if broken
+    if command -v sshd &>/dev/null && ! sshd -t 2>/dev/null; then
+        print_warn "sshd_config validation failed — rolling back"
+        if [[ -f /etc/ssh/sshd_config.dnstm-backup ]]; then
+            cp -f /etc/ssh/sshd_config.dnstm-backup /etc/ssh/sshd_config
+            print_ok "Restored sshd_config from backup"
+        fi
     fi
 
     echo ""
@@ -4991,6 +5165,18 @@ step_summary() {
     echo "  dnstm tunnel logs --tag slip1   View tunnel logs"
     echo ""
 
+    echo -e "  ${BOLD}Management TUI${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Run ${GREEN}dnstm-setup --manage${NC} to open the full management menu."
+    echo "  From there you can:"
+    echo "    - Add/remove tunnels and domains"
+    echo "    - Add Xray backend (VLESS/VMess/Trojan)"
+    echo "    - Manage SSH tunnel users"
+    echo "    - Change DNSTT MTU"
+    echo "    - View status, logs, and share URLs"
+    echo "    - Harden or uninstall"
+    echo ""
+
     echo -e "  ${DIM}Setup by dnstm-setup v${VERSION} — SamNet Technologies${NC}"
     echo -e "  ${DIM}https://github.com/SamNet-dev/dnstm-setup${NC}"
     echo ""
@@ -5051,7 +5237,7 @@ do_add_domain() {
     fi
 
     # Detect server IP
-    SERVER_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
     if [[ -z "$SERVER_IP" ]]; then
         SERVER_IP=$(prompt_input "Enter your server's public IP")
         if [[ -z "$SERVER_IP" ]]; then
