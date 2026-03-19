@@ -2508,6 +2508,10 @@ detect_xray_panel() {
                 XRAY_PANEL_PORT=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null || true)
             fi
         fi
+        # Validate port is numeric
+        if [[ -n "$XRAY_PANEL_PORT" && ! "$XRAY_PANEL_PORT" =~ ^[0-9]+$ ]]; then
+            XRAY_PANEL_PORT=""
+        fi
 
         # Method 3: Try common 3x-ui ports (skip 443 — too likely to be nginx)
         if [[ -z "$XRAY_PANEL_PORT" ]]; then
@@ -2522,16 +2526,27 @@ detect_xray_panel() {
         # Method 4: Fall back to default
         XRAY_PANEL_PORT="${XRAY_PANEL_PORT:-2053}"
 
-        # Detect web base path (many users set this for security)
+        # Detect web base path (3x-ui v2.0+ sets a random base path by default)
         XRAY_PANEL_BASEPATH=""
+        # Method 1: Parse config.json
         if [[ -f /usr/local/x-ui/config.json ]]; then
             XRAY_PANEL_BASEPATH=$(jq -r '.webBasePath // empty' /usr/local/x-ui/config.json 2>/dev/null || true)
         fi
+        # Method 2: Query sqlite database
         if [[ -z "$XRAY_PANEL_BASEPATH" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
             XRAY_PANEL_BASEPATH=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webBasePath'" 2>/dev/null || true)
         fi
-        # Normalize: strip leading/trailing slashes
-        XRAY_PANEL_BASEPATH=$(echo "${XRAY_PANEL_BASEPATH:-}" | sed 's|^/||;s|/$||')
+        # Method 3: Try to read from x-ui process environment or binary output
+        if [[ -z "$XRAY_PANEL_BASEPATH" ]]; then
+            # Some 3x-ui versions expose base path in config output
+            local xui_config_output
+            xui_config_output=$(x-ui setting -show 2>/dev/null || true)
+            if [[ -n "$xui_config_output" ]]; then
+                XRAY_PANEL_BASEPATH=$(echo "$xui_config_output" | grep -i 'webBasePath\|basePath' | sed 's/.*:[[:space:]]*//' | head -1 || true)
+            fi
+        fi
+        # Normalize: strip whitespace and leading/trailing slashes
+        XRAY_PANEL_BASEPATH=$(echo "${XRAY_PANEL_BASEPATH:-}" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^/||;s|/$||')
     fi
 }
 
@@ -2645,8 +2660,6 @@ pick_xray_port() {
 create_3xui_inbound() {
     local base_segment=""
     [[ -n "${XRAY_PANEL_BASEPATH:-}" ]] && base_segment="/${XRAY_PANEL_BASEPATH}"
-    # Auto-detect HTTPS: try connecting, if http fails with empty response, try https
-    local panel_url="http://127.0.0.1:${XRAY_PANEL_PORT}${base_segment}"
     local cookie_jar
     cookie_jar=$(mktemp)
     chmod 600 "$cookie_jar" 2>/dev/null || true
@@ -2663,18 +2676,38 @@ create_3xui_inbound() {
         XRAY_PASSWORD=$(openssl rand -hex 16)
     fi
 
-    # Login to panel
+    # Auto-detect panel URL: try http, then https, with and without base path
     print_info "Logging in to 3x-ui panel..."
-    local login_resp
-    login_resp=$(curl -s -L -k -c "$cookie_jar" -X POST "${panel_url}/login" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data-urlencode "username=${XRAY_ADMIN_USER}" \
-        --data-urlencode "password=${XRAY_ADMIN_PASS}" \
-        --max-time 10 2>/dev/null || true)
+    local panel_url=""
+    local login_resp=""
+    local try_urls=()
+
+    # Build list of URLs to try (with base path first, then without)
+    if [[ -n "$base_segment" ]]; then
+        try_urls+=("http://127.0.0.1:${XRAY_PANEL_PORT}${base_segment}")
+        try_urls+=("https://127.0.0.1:${XRAY_PANEL_PORT}${base_segment}")
+    fi
+    try_urls+=("http://127.0.0.1:${XRAY_PANEL_PORT}")
+    try_urls+=("https://127.0.0.1:${XRAY_PANEL_PORT}")
+
+    for try_url in "${try_urls[@]}"; do
+        login_resp=$(curl -s -L -k -c "$cookie_jar" -X POST "${try_url}/login" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "username=${XRAY_ADMIN_USER}" \
+            --data-urlencode "password=${XRAY_ADMIN_PASS}" \
+            --max-time 5 2>/dev/null || true)
+        if [[ -n "$login_resp" ]]; then
+            panel_url="$try_url"
+            break
+        fi
+        # Clear cookie jar between attempts
+        : > "$cookie_jar"
+    done
 
     if [[ -z "$login_resp" ]]; then
-        print_fail "Could not connect to 3x-ui panel at ${panel_url}"
+        print_fail "Could not connect to 3x-ui panel on port ${XRAY_PANEL_PORT}"
         print_info "Is the panel running? Check: systemctl status x-ui"
+        print_info "If your panel has a custom base path, check: sqlite3 /etc/x-ui/x-ui.db \"SELECT value FROM settings WHERE key='webBasePath'\""
         return 1
     fi
 
