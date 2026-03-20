@@ -849,6 +849,10 @@ do_status() {
     if command -v sshtun-user &>/dev/null; then
         local user_list
         user_list=$(timeout 10 sshtun-user list </dev/null 2>/dev/null || true)
+        # Fallback: sshtun-user list may require TTY
+        if [[ -z "$user_list" ]]; then
+            user_list=$(awk -F: '/SSH tunnel only/{print $1}' /etc/passwd 2>/dev/null || true)
+        fi
         if [[ -n "$user_list" ]]; then
             has_ssh_users=true
             echo -e "  ${BOLD}SSH Tunnel Users${NC}"
@@ -905,6 +909,10 @@ do_status() {
         # Extract domain for this tunnel from dnstm
         local tag_domain
         tag_domain=$(echo "$tunnel_list_output" | grep -wF "$tag" | grep -oE 'domain=[^ ]+' | head -1 | sed 's/domain=//' || true)
+        # Fallback: parse table format (TAG TRANSPORT BACKEND PORT DOMAIN STATUS)
+        if [[ -z "$tag_domain" ]]; then
+            tag_domain=$(echo "$tunnel_list_output" | awk -v t="$tag" '$1 == t {for(i=2;i<=NF;i++) if($i ~ /\./) {print $i; exit}}' || true)
+        fi
         if [[ -z "$tag_domain" ]]; then
             continue
         fi
