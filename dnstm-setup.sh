@@ -3447,6 +3447,57 @@ ensure_noizdns_binary() {
 
 # ─── NoizDNS Service Override ─────────────────────────────────────────────────
 
+# Fix NoizDNS tunnel transport in dnstm config.json
+# We create noiz tunnels with --transport dnstt (dnstm tunnel add only accepts
+# slipstream or dnstt). Newer dnstm versions support "noizdns" as a transport
+# type in the router — if so, noiz tunnels should use it for proper decoding.
+# Older versions only know dnstt, so noiz tunnels must stay as dnstt there.
+fix_noizdns_transport() {
+    local config="/etc/dnstm/config.json"
+    [[ -f "$config" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    # Detect if this version of dnstm supports "noizdns" transport
+    local supports_noizdns=false
+    if dnstm tunnel add --help 2>&1 | grep -qi "noizdns" || \
+       dnstm --help 2>&1 | grep -qi "noizdns"; then
+        supports_noizdns=true
+    else
+        # Quick probe: try creating a test config in memory to see if router accepts noizdns
+        local test_config='{"tunnels":[{"tag":"_test","transport":"noizdns","backend":"socks","domain":"test.example.com","port":9999}]}'
+        if echo "$test_config" | dnstm router validate 2>&1 | grep -qi "valid" 2>/dev/null; then
+            supports_noizdns=true
+        fi
+    fi
+
+    local changed=false
+    local tmp_config="${config}.tmp.$$"
+
+    if [[ "$supports_noizdns" == true ]]; then
+        # Newer dnstm: noiz tunnels should have transport "noizdns"
+        if jq -e '.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "dnstt")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "dnstt") | .transport) = "noizdns"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed NoizDNS tunnel transport in dnstm config (dnstt → noizdns)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    else
+        # Older dnstm: noiz tunnels must stay as "dnstt" (router doesn't know noizdns)
+        if jq -e '.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "noizdns")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "noizdns") | .transport) = "dnstt"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed NoizDNS tunnel transport in dnstm config (noizdns → dnstt for older dnstm)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    fi
+}
+
 # Override a DNSTT tunnel's systemd service to use the NoizDNS binary instead.
 # NoizDNS does NOT support -udp flag — it uses Pluggable Transport (PT) mode
 # with TOR_PT_* environment variables for bind address and upstream.
@@ -4739,6 +4790,9 @@ step_create_tunnels() {
         # but we need them to run noizdns-server via the drop-in override)
         systemctl stop "dnstm-noiz1.service" 2>/dev/null || true
         systemctl stop "dnstm-noiz-ssh.service" 2>/dev/null || true
+
+        # Fix transport field if dnstm rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
     else
         echo ""
         print_warn "NoizDNS binary not available — skipping NoizDNS tunnels (n, z subdomains)"
@@ -4844,6 +4898,9 @@ step_start_services() {
             fi
         fi
     done
+
+    # Fix transport field if dnstm rewrote it during start
+    fix_noizdns_transport
 
     echo ""
 
@@ -5823,6 +5880,9 @@ do_add_domain() {
         # (dnstm tunnel add auto-starts with dnstt-server, not noizdns-server)
         systemctl stop "dnstm-${noiz_tag}.service" 2>/dev/null || true
         systemctl stop "dnstm-${noiz_ssh_tag}.service" 2>/dev/null || true
+
+        # Fix transport field if dnstm rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
     fi
 
     print_ok "All tunnels created"
@@ -5880,6 +5940,9 @@ do_add_domain() {
             fi
         fi
     done
+
+    # Fix transport field if dnstm rewrote it during start
+    fix_noizdns_transport
 
     # NOW start the router (all backends are healthy)
     echo ""
