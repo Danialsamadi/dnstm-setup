@@ -2318,7 +2318,18 @@ do_manage_users() {
                 echo ""
                 print_info "SSH tunnel users:"
                 echo ""
-                timeout 10 sshtun-user list 2>&1 || print_warn "No users found or sshtun-user error"
+                if ! timeout 10 sshtun-user list 2>/dev/null; then
+                    # Fallback: sshtun-user list requires TTY on some versions
+                    local tun_users
+                    tun_users=$(awk -F: '/SSH tunnel only/{print $1}' /etc/passwd 2>/dev/null)
+                    if [[ -n "$tun_users" ]]; then
+                        echo "$tun_users" | while IFS= read -r u; do
+                            echo -e "  ${GREEN}${u}${NC}"
+                        done
+                    else
+                        print_warn "No tunnel users found"
+                    fi
+                fi
                 ;;
             2)
                 echo ""
