@@ -2956,6 +2956,12 @@ detect_xray_panel() {
                 XRAY_PANEL_PORT=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null || true)
             fi
         fi
+        # Method 2b: Query x-ui binary directly
+        if [[ -z "$XRAY_PANEL_PORT" ]]; then
+            XRAY_PANEL_PORT=$(/usr/local/x-ui/x-ui setting -show 2>/dev/null | grep -Ei '^\s*port:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)
+            [[ -z "$XRAY_PANEL_PORT" ]] && \
+                XRAY_PANEL_PORT=$(x-ui settings 2>/dev/null | grep -Ei '^\s*port:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)
+        fi
         # Validate port is numeric
         if [[ -n "$XRAY_PANEL_PORT" && ! "$XRAY_PANEL_PORT" =~ ^[0-9]+$ ]]; then
             XRAY_PANEL_PORT=""
