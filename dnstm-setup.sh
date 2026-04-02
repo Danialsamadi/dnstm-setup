@@ -541,6 +541,7 @@ show_help() {
     echo "  sudo bash dnstm-setup.sh --uninstall   Remove everything"
     echo "  sudo bash dnstm-setup.sh --status      Show all tunnels & share URLs"
     echo "  sudo bash dnstm-setup.sh --monitor     Monitor tunnel usage & connections"
+    echo "  sudo bash dnstm-setup.sh --diag        Diagnose tunnel issues"
     echo "  bash dnstm-setup.sh --help             Show this help"
     echo "  bash dnstm-setup.sh --about            Show project info"
     echo ""
@@ -550,6 +551,7 @@ show_help() {
     echo "  --manage       Interactive management menu (all post-setup actions)"
     echo "  --status       Show all tunnels, credentials, and share URLs"
     echo "  --monitor      Show tunnel process stats, connections, and recent logs"
+    echo "  --diag         Run diagnostics: binaries, services, ports, DNS, config"
     echo "  --add-tunnel   Add a single tunnel (interactive: choose transport, backend, domain)"
     echo "  --add-xray     Connect existing 3x-ui panel to DNS tunnel (auto-detect + create inbound)"
     echo "  --remove-tunnel [tag]  Remove a specific tunnel (interactive if no tag given)"
@@ -1264,6 +1266,397 @@ do_monitor() {
 
     echo -e "  ${DIM}Tip: Run with watch for live monitoring:${NC}"
     echo -e "  ${DIM}  watch -n 5 sudo bash $0 --monitor${NC}"
+    echo ""
+}
+
+# ─── --diag ────────────────────────────────────────────────────────────────────
+
+do_diag() {
+    banner
+    echo -e "  ${BOLD}Tunnel Diagnostics${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo ""
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Diagnostics require root. Run: sudo bash $0 --diag"
+        exit 1
+    fi
+
+    local issues=0
+
+    # ─── 1. Core binaries ───
+    echo -e "  ${BOLD}1. Binary Checks${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    if command -v dnstm &>/dev/null; then
+        local dnstm_ver
+        dnstm_ver=$(timeout 5 dnstm --version 2>/dev/null || echo "unknown")
+        print_ok "dnstm installed (${dnstm_ver})"
+    else
+        print_fail "dnstm not installed"
+        issues=$((issues + 1))
+    fi
+
+    if [[ -x /usr/local/bin/dnstt-server ]]; then
+        if timeout 5 /usr/local/bin/dnstt-server -help 2>&1 | grep -q '\-udp'; then
+            print_ok "dnstt-server binary valid (supports -udp)"
+        else
+            print_fail "dnstt-server binary is wrong (missing -udp flag) — may be NoizDNS fork"
+            echo -e "    ${DIM}Fix: re-run setup or manually download correct dnstt-server${NC}"
+            issues=$((issues + 1))
+        fi
+    else
+        print_warn "dnstt-server not found (DNSTT tunnels won't work)"
+    fi
+
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        local magic
+        magic=$(xxd -l4 -p /usr/local/bin/noizdns-server 2>/dev/null || od -A n -t x1 -N4 /usr/local/bin/noizdns-server 2>/dev/null | tr -d ' ' || true)
+        if [[ "$magic" == "7f454c46" ]]; then
+            print_ok "noizdns-server binary valid (ELF)"
+        else
+            print_fail "noizdns-server binary is corrupt (not a valid ELF)"
+            issues=$((issues + 1))
+        fi
+    else
+        print_info "noizdns-server not installed (NoizDNS tunnels skipped)"
+    fi
+
+    if [[ -x /usr/local/bin/microsocks ]] || command -v microsocks &>/dev/null; then
+        print_ok "microsocks installed"
+    else
+        print_warn "microsocks not found"
+    fi
+    echo ""
+
+    # ─── 2. Service status ───
+    echo -e "  ${BOLD}2. Service Status${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local tunnel_list_output
+    tunnel_list_output=$(timeout --kill-after=3 10 dnstm tunnel list 2>/dev/null || true)
+
+    # Router
+    if systemctl is-active --quiet dnstm-dnsrouter.service 2>/dev/null; then
+        print_ok "DNS Router: running"
+    else
+        print_fail "DNS Router: not running"
+        local router_log
+        router_log=$(journalctl -u dnstm-dnsrouter.service -n 3 --no-pager --no-hostname --output=short-precise 2>/dev/null | tail -3 || true)
+        [[ -n "$router_log" ]] && echo -e "    ${DIM}${router_log}${NC}"
+        issues=$((issues + 1))
+    fi
+
+    # microsocks
+    if systemctl is-active --quiet microsocks.service 2>/dev/null; then
+        print_ok "microsocks: running"
+    else
+        print_warn "microsocks: not running"
+    fi
+
+    # Per-tunnel services
+    local tags
+    tags=$(echo "$tunnel_list_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    if [[ -z "$tags" ]]; then
+        tags=$(echo "$tunnel_list_output" | grep -oE '\b(slip|dnstt|noiz|xray)[a-z0-9_-]*' | sort -u || true)
+    fi
+
+    for tag in $tags; do
+        local svc="dnstm-${tag}.service"
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            print_ok "${tag}: running"
+        else
+            local tag_line
+            tag_line=$(echo "$tunnel_list_output" | grep -wF "$tag" | head -1)
+            if echo "$tag_line" | grep -qi "stopped"; then
+                print_info "${tag}: stopped (configured but not running)"
+            else
+                print_fail "${tag}: not running"
+                local svc_log
+                svc_log=$(journalctl -u "$svc" -n 2 --no-pager --no-hostname --output=short-precise 2>/dev/null | tail -2 || true)
+                [[ -n "$svc_log" ]] && echo -e "    ${DIM}${svc_log}${NC}"
+                issues=$((issues + 1))
+            fi
+        fi
+    done
+    echo ""
+
+    # ─── 3. NoizDNS service overrides ───
+    local has_noiz=false
+    for tag in $tags; do
+        [[ "$tag" == noiz* ]] && has_noiz=true && break
+    done
+    if [[ "$has_noiz" == true ]]; then
+        echo -e "  ${BOLD}3. NoizDNS Configuration${NC}"
+        echo -e "  ${DIM}──────────────────────────${NC}"
+        for tag in $tags; do
+            [[ "$tag" != noiz* ]] && continue
+            local dropin="/etc/systemd/system/dnstm-${tag}.service.d/10-noizdns-binary.conf"
+            if [[ -f "$dropin" ]]; then
+                if grep -q "noizdns-server" "$dropin" 2>/dev/null; then
+                    print_ok "${tag}: binary override present (noizdns-server)"
+                else
+                    print_fail "${tag}: override exists but doesn't reference noizdns-server"
+                    issues=$((issues + 1))
+                fi
+                if grep -q "TOR_PT_SERVER_BINDADDR" "$dropin" 2>/dev/null; then
+                    print_ok "${tag}: PT mode environment variables set"
+                else
+                    print_fail "${tag}: missing TOR_PT_* environment variables"
+                    issues=$((issues + 1))
+                fi
+            else
+                print_fail "${tag}: no binary override — running dnstt-server instead of noizdns-server"
+                echo -e "    ${DIM}Fix: re-run setup or: create_noizdns_service_override ${tag}${NC}"
+                issues=$((issues + 1))
+            fi
+        done
+        echo ""
+    fi
+
+    # ─── Config.json transport check ───
+    local section_num=3
+    [[ "$has_noiz" == true ]] && section_num=4
+    echo -e "  ${BOLD}${section_num}. Tunnel Configuration${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local config="/etc/dnstm/config.json"
+    if [[ -f "$config" ]]; then
+        if command -v jq &>/dev/null; then
+            local tunnel_info
+            tunnel_info=$(jq -r '.tunnels[]? | "\(.tag)|\(.transport)|\(.domain)|\(.mtu // "n/a")"' "$config" 2>/dev/null || true)
+            if [[ -n "$tunnel_info" ]]; then
+                printf "  ${BOLD}%-16s %-14s %-24s %-s${NC}\n" "TAG" "TRANSPORT" "DOMAIN" "MTU"
+                echo "$tunnel_info" | while IFS='|' read -r t_tag t_transport t_domain t_mtu; do
+                    local col="$GREEN"
+                    # Flag potential issues
+                    if [[ "$t_tag" == noiz* && "$t_transport" == "dnstt" ]]; then
+                        # Could be fine (older dnstm) or wrong (newer dnstm)
+                        col="$YELLOW"
+                    fi
+                    printf "  %-16s ${col}%-14s${NC} %-24s %-s\n" "$t_tag" "$t_transport" "$t_domain" "$t_mtu"
+                done
+            fi
+        elif command -v python3 &>/dev/null; then
+            python3 -c '
+import sys, json
+try:
+    cfg = json.load(sys.stdin)
+    for t in cfg.get("tunnels", []):
+        print(f"  {t.get(\"tag\",\"?\"):16s} {t.get(\"transport\",\"?\"):14s} {t.get(\"domain\",\"?\"):24s} {t.get(\"mtu\",\"n/a\")}")
+except: pass
+' < "$config" 2>/dev/null || true
+        else
+            print_warn "Neither jq nor python3 available — cannot parse config.json"
+        fi
+
+        # Check for MTU issues (DNSTT/NoizDNS tunnels)
+        local high_mtu_tags=""
+        if command -v jq &>/dev/null; then
+            high_mtu_tags=$(jq -r '.tunnels[]? | select(.transport == "dnstt" or .transport == "noizdns") | select(.mtu > 1000) | .tag' "$config" 2>/dev/null || true)
+        elif command -v python3 &>/dev/null; then
+            high_mtu_tags=$(python3 -c '
+import sys, json
+try:
+    for t in json.load(sys.stdin).get("tunnels", []):
+        if t.get("transport","") in ("dnstt","noizdns") and t.get("mtu",0) > 1000:
+            print(t["tag"])
+except: pass
+' < "$config" 2>/dev/null || true)
+        fi
+        if [[ -n "$high_mtu_tags" ]]; then
+            echo ""
+            print_warn "High MTU detected on DNSTT/NoizDNS tunnels (may cause data issues):"
+            for t in $high_mtu_tags; do
+                echo -e "    ${YELLOW}${t}${NC} — try reducing MTU to 800-1000 if data doesn't flow"
+            done
+        fi
+    else
+        print_fail "Config file not found: ${config}"
+        issues=$((issues + 1))
+    fi
+    echo ""
+
+    # ─── 5. Port 53 binding ───
+    section_num=$((section_num + 1))
+    echo -e "  ${BOLD}${section_num}. Network & Ports${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local port53_owner
+    port53_owner=$(ss -ulnp 2>/dev/null | grep ":53\b" | head -1 || true)
+    if [[ -n "$port53_owner" ]]; then
+        if echo "$port53_owner" | grep -q "dnstm"; then
+            print_ok "Port 53 UDP: bound by dnstm"
+        elif echo "$port53_owner" | grep -q "systemd-resolve"; then
+            print_fail "Port 53 UDP: bound by systemd-resolved (conflicts with dnstm)"
+            echo -e "    ${DIM}Fix: sudo systemctl disable --now systemd-resolved${NC}"
+            issues=$((issues + 1))
+        else
+            print_warn "Port 53 UDP: bound by unknown process"
+            echo -e "    ${DIM}${port53_owner}${NC}"
+        fi
+    else
+        print_fail "Port 53 UDP: nothing listening"
+        issues=$((issues + 1))
+    fi
+
+    # Port 53 TCP
+    local port53_tcp
+    port53_tcp=$(ss -tlnp 2>/dev/null | grep ":53\b" | head -1 || true)
+    if [[ -n "$port53_tcp" ]]; then
+        print_ok "Port 53 TCP: listening"
+    else
+        print_warn "Port 53 TCP: not listening (some clients need this)"
+    fi
+
+    # SSH reachability (for SSH tunnels)
+    local has_ssh_tunnels=false
+    for tag in $tags; do
+        [[ "$tag" == *ssh* ]] && has_ssh_tunnels=true && break
+    done
+    if [[ "$has_ssh_tunnels" == true ]]; then
+        if timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/22' &>/dev/null 2>&1 || timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+            print_ok "SSH (127.0.0.1:22): reachable"
+        else
+            print_fail "SSH (127.0.0.1:22): not reachable — SSH tunnels will fail"
+            echo -e "    ${DIM}Fix: sudo systemctl restart sshd${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    # Firewall
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        if ufw status 2>/dev/null | grep -qE "53.*(ALLOW|allow)"; then
+            print_ok "UFW: port 53 allowed"
+        else
+            print_warn "UFW is active but port 53 may not be allowed"
+            echo -e "    ${DIM}Fix: sudo ufw allow 53${NC}"
+        fi
+    fi
+    if command -v iptables &>/dev/null; then
+        local ipt_drop
+        ipt_drop=$(timeout 5 iptables -L INPUT -n 2>/dev/null | grep -i "drop.*dpt:53\|reject.*dpt:53" || true)
+        if [[ -n "$ipt_drop" ]]; then
+            print_fail "iptables: port 53 is being dropped/rejected"
+            echo -e "    ${DIM}${ipt_drop}${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+    echo ""
+
+    # ─── 6. DNS resolution test ───
+    section_num=$(( ${section_num} + 1 ))
+    echo -e "  ${BOLD}${section_num}. DNS Key & Resolution${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    # Check public keys exist
+    for tag in $tags; do
+        [[ "$tag" == slip* ]] && continue  # Slipstream doesn't use pubkeys
+        local pubkey_file="/etc/dnstm/tunnels/${tag}/server.pub"
+        if [[ -f "$pubkey_file" ]]; then
+            local pk
+            pk=$(cat "$pubkey_file" 2>/dev/null || true)
+            if [[ -n "$pk" ]]; then
+                print_ok "${tag}: public key present (${pk:0:16}...)"
+            else
+                print_fail "${tag}: public key file is empty"
+                issues=$((issues + 1))
+            fi
+        else
+            print_warn "${tag}: no public key file"
+        fi
+    done
+
+    # Check private keys exist
+    for tag in $tags; do
+        [[ "$tag" == slip* ]] && continue
+        local privkey_file="/etc/dnstm/tunnels/${tag}/server.key"
+        if [[ -f "$privkey_file" ]]; then
+            print_ok "${tag}: private key present"
+        else
+            print_fail "${tag}: private key missing — tunnel cannot decrypt"
+            issues=$((issues + 1))
+        fi
+    done
+
+    # External DNS test
+    local test_domain=""
+    if [[ -f "$config" ]]; then
+        if command -v jq &>/dev/null; then
+            test_domain=$(jq -r '.tunnels[0]?.domain // empty' "$config" 2>/dev/null || true)
+        elif command -v python3 &>/dev/null; then
+            test_domain=$(python3 -c '
+import sys, json
+try:
+    t = json.load(sys.stdin).get("tunnels",[])
+    if t: print(t[0].get("domain",""))
+except: pass
+' < "$config" 2>/dev/null || true)
+        fi
+    fi
+    if [[ -n "$test_domain" ]]; then
+        echo ""
+        print_info "Testing DNS resolution for ${test_domain}..."
+        local dig_result
+        if command -v dig &>/dev/null; then
+            dig_result=$(timeout 10 dig @8.8.8.8 "$test_domain" NS +short +time=5 +tries=1 2>/dev/null || true)
+        elif command -v nslookup &>/dev/null; then
+            dig_result=$(timeout 5 nslookup -type=NS "$test_domain" 8.8.8.8 2>/dev/null | grep -i "nameserver\|server" || true)
+        fi
+        if [[ -n "$dig_result" ]]; then
+            print_ok "DNS resolves: ${dig_result}"
+        else
+            print_warn "DNS resolution returned empty (may be normal for subdomain)"
+        fi
+    fi
+    echo ""
+
+    # ─── 7. systemd-resolved conflict ───
+    section_num=$(( ${section_num} + 1 ))
+    echo -e "  ${BOLD}${section_num}. System Conflicts${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+        print_fail "systemd-resolved is running — may conflict with port 53"
+        echo -e "    ${DIM}Fix: sudo systemctl disable --now systemd-resolved${NC}"
+        issues=$((issues + 1))
+    else
+        print_ok "systemd-resolved: disabled/stopped"
+    fi
+
+    # Check /etc/resolv.conf
+    if [[ -L /etc/resolv.conf ]]; then
+        local resolv_target
+        resolv_target=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+        if [[ "$resolv_target" == *"systemd"* ]]; then
+            print_warn "/etc/resolv.conf points to systemd-resolved stub"
+            echo -e "    ${DIM}May cause DNS issues. Check: cat /etc/resolv.conf${NC}"
+        else
+            print_ok "/etc/resolv.conf: symlink to ${resolv_target}"
+        fi
+    elif [[ -f /etc/resolv.conf ]]; then
+        local nameserver
+        nameserver=$(grep -m1 'nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)
+        if [[ "$nameserver" == "127.0.0.53" ]]; then
+            print_warn "/etc/resolv.conf uses 127.0.0.53 (systemd-resolved stub)"
+        else
+            print_ok "/etc/resolv.conf nameserver: ${nameserver:-unknown}"
+        fi
+    fi
+    echo ""
+
+    # ─── Summary ───
+    echo -e "  ${DIM}════════════════════════════════════════${NC}"
+    if [[ $issues -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}All checks passed — no issues found${NC}"
+        echo ""
+        echo -e "  ${DIM}If DNSTT/NoizDNS tunnels connect but don't transmit data, try lower MTU.${NC}"
+        echo -e "  ${DIM}See: https://github.com/SamNet-dev/dnstm-setup/issues/35${NC}"
+    else
+        echo -e "  ${RED}${BOLD}Found ${issues} issue(s)${NC}"
+        echo ""
+        echo -e "  ${DIM}Fix the issues above, then re-run: sudo bash $0 --diag${NC}"
+    fi
     echo ""
 }
 
@@ -6579,6 +6972,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --monitor)
             do_monitor
+            exit 0
+            ;;
+        --diag)
+            do_diag
             exit 0
             ;;
         --manage)
