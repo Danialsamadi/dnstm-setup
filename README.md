@@ -2,13 +2,13 @@
 
 > **Interactive DNS Tunnel Setup Wizard** — automated server deployment for unrestricted internet access.
 
-Deploys [dnstm](https://github.com/net2share/dnstm) DNS tunnel servers with **Slipstream**, **DNSTT**, and **NoizDNS** protocols. Designed to help people in restricted regions stay connected to the free internet.
+Deploys [dnstm](https://github.com/net2share/dnstm) DNS tunnel servers with **Slipstream**, **DNSTT**, **NoizDNS**, and **VayDNS** protocols. Designed to help people in restricted regions stay connected to the free internet.
 
 ---
 
 ## 📑 Table of Contents
 
-- [🆕 What's New in v1.3](#-whats-new-in-v13)
+- [🆕 What's New in v1.4](#-whats-new-in-v14)
 - [🔍 How DNS Tunneling Works](#-how-dns-tunneling-works)
 - [🏗️ Architecture](#️-architecture)
 - [📦 What Gets Installed](#-what-gets-installed)
@@ -35,9 +35,9 @@ Deploys [dnstm](https://github.com/net2share/dnstm) DNS tunnel servers with **Sl
 
 ---
 
-## 🆕 What's New in v1.3
+## 🆕 What's New in v1.4
 
-### 🛡️ NoizDNS Tunnels (DPI-Resistant)
+### ⚡ VayDNS Tunnels (Optimized)
 
 Two new tunnel types added to the main setup — **NoizDNS + SOCKS** (`n` subdomain) and **NoizDNS + SSH** (`z` subdomain). NoizDNS is a [DPI-resistant fork of DNSTT](https://github.com/anonvector/noizdns-deploy) by anonvector (same author as SlipNet) that uses alternative DNS query encoding to evade Deep Packet Inspection. The server auto-detects both standard DNSTT and NoizDNS clients, so existing setups keep working.
 
@@ -45,6 +45,17 @@ Two new tunnel types added to the main setup — **NoizDNS + SOCKS** (`n` subdom
 - **Zero extra configuration** — NoizDNS binary is downloaded automatically during setup
 - **Graceful degradation** — if the download fails, the script creates the standard 4 tunnels and continues
 - **In SlipNet**, select **NoizDNS** as the tunnel type for `n` and `z` subdomains
+
+### ⚡ VayDNS Tunnels (Optimized)
+
+Two new tunnel types — **VayDNS + SOCKS** (`v` subdomain) and **VayDNS + SSH** (`vz` subdomain). [VayDNS](https://github.com/net2share/vaydns) is an optimized fork of DNSTT by net2share with KCP/smux sessions, auto-recovery, and a leaner wire protocol. Runs in `-dnstt-compat` mode for backwards compatibility with existing SlipNet clients.
+
+- **Up to 8 tunnels** (Slipstream + DNSTT + NoizDNS + VayDNS, each with SOCKS and SSH)
+- **Zero extra configuration** — VayDNS binary is downloaded automatically during setup
+- **Graceful degradation** — if the download fails, the script continues with other tunnel types
+- **Transport option 4** in `--add-tunnel` TUI
+- **`--monitor`** — new command for live tunnel stats (CPU, memory, uptime, connections)
+- **`--diag`** — new command for comprehensive tunnel diagnostics
 
 ### 🔌 Xray Backend Integration (Optional)
 
@@ -58,12 +69,12 @@ New optional feature to connect an existing **3x-ui panel** (or raw Xray) to a D
 
 ### Other Improvements
 
-- **7 DNS records** (was 5) — 2 new NS records for NoizDNS subdomains (`n`, `z`)
-- **`--add-domain`** now creates NoizDNS tunnels for backup domains too (auto-downloads NoizDNS binary if missing)
-- **`--add-tunnel`** (TUI option 2) now offers NoizDNS as a transport choice alongside Slipstream and DNSTT
+- **9 DNS records** (was 5) — NS records for NoizDNS (`n`, `z`) and VayDNS (`v`, `vz`) subdomains
+- **`--add-domain`** now creates NoizDNS and VayDNS tunnels for backup domains too
+- **`--add-tunnel`** now offers 4 transport choices: Slipstream, DNSTT, NoizDNS, VayDNS
 - **`--manage`** (TUI option 9) adds Change DNSTT MTU — update MTU on existing DNSTT tunnels without recreating them
-- **`--status`** displays NoizDNS tunnel info and SlipNet URLs
-- **`--remove-tunnel`** properly cleans up Xray and NoizDNS service overrides
+- **`--status`** displays all tunnel info and SlipNet URLs including VayDNS
+- **`--remove-tunnel`** properly cleans up Xray, NoizDNS, and VayDNS service overrides
 - **Security hardening** — SQL injection prevention, cookie jar cleanup, restrictive file permissions, URL-safe base64 encoding
 - **Portable code** — no `grep -P` (Perl regex), no `python3` dependency, pure bash URL encoding
 
@@ -121,6 +132,12 @@ Because the traffic looks like ordinary DNS resolution, it passes through filter
      +---> z.domain ---> NoizDNS ------> SSH Tunnel ------------> 🌐 Internet
      |                    (DPI-resistant)   (port forwarding)
      |
+     +---> v.domain ---> VayDNS -------> microsocks (SOCKS5) ---> 🌐 Internet
+     |                    (optimized DNSTT, KCP/smux)
+     |
+     +---> vz.domain --> VayDNS -------> SSH Tunnel ------------> 🌐 Internet
+     |                    (optimized)      (port forwarding)
+     |
      +---> x.domain ---> DNSTT --------> Xray (VLESS/SS/VMess/Trojan) -> 🌐 Internet
                           (Noise + Curve25519) (optional, via --add-xray)
 ```
@@ -149,25 +166,30 @@ When someone queries `t.yourdomain.com`, the global DNS system follows this chai
 | ⚡ **Slipstream Server** | QUIC-based DNS tunnel | TLS encryption with self-signed certificates — Speed: **~63 KB/s** |
 | 🔐 **DNSTT Server** | Classic DNS tunnel | Noise protocol with Curve25519 key pairs — Speed: **~42 KB/s** |
 | 🛡️ **NoizDNS Server** | DPI-resistant DNS tunnel | Modified DNSTT fork with enhanced query encoding to evade Deep Packet Inspection — Speed: **~42 KB/s** |
+| ⚡ **VayDNS Server** | Optimized DNS tunnel | DNSTT fork with KCP/smux sessions, auto-recovery, and leaner wire protocol — Speed: **~42 KB/s** |
 | 🧦 **microsocks** | SOCKS5 proxy | Lightweight proxy shared by all tunnels (port auto-assigned by dnstm) |
 | 👤 **sshtun-user** | SSH user manager | *(Optional)* Creates restricted users that can only do port forwarding |
 
-### 🚇 Six Tunnel Types
+### 🚇 Eight Tunnel Types
 
 | Tunnel | Subdomain | Transport | Backend | Use Case |
 |---|---|---|---|---|
 | ⚡ **slip1** | `t.domain` | Slipstream (QUIC) | SOCKS | Fastest — recommended for most users |
 | 🔐 **dnstt1** | `d.domain` | DNSTT (Noise) | SOCKS | Fallback if Slipstream is blocked |
 | 🛡️ **noiz1** | `n.domain` | NoizDNS (DPI-resistant) | SOCKS | Best for heavy censorship / DPI environments |
+| ⚡ **vay1** | `v.domain` | VayDNS (optimized) | SOCKS | Optimized DNSTT with auto-recovery |
 | 🔑 **slip-ssh** | `s.domain` | Slipstream (QUIC) | SSH | When you need per-user authentication |
 | 🔑 **dnstt-ssh** | `ds.domain` | DNSTT (Noise) | SSH | SSH fallback if Slipstream is blocked |
 | 🛡️ **noiz-ssh** | `z.domain` | NoizDNS (DPI-resistant) | SSH | DPI-resistant SSH tunnel |
+| ⚡ **vay-ssh** | `vz.domain` | VayDNS (optimized) | SSH | Optimized SSH tunnel with auto-recovery |
 
 > 🧦 **SOCKS backend:** Optionally secured with SOCKS5 username/password authentication. Without auth, anyone who knows the domain can connect.
 >
 > 🔑 **SSH backend:** Requires username + password. Provides per-user access control. The SSH user is restricted — even if credentials leak, no one can access your server.
 >
-> 🛡️ **NoizDNS:** A DPI-resistant fork of DNSTT by [anonvector](https://github.com/anonvector) (same author as SlipNet). Uses alternative DNS query encoding designed to evade Deep Packet Inspection systems in heavily censored networks. The server auto-detects both standard DNSTT and NoizDNS clients. In SlipNet, select **NoizDNS** as the tunnel type for `n` and `z` subdomains.
+> 🛡️ **NoizDNS:** A DPI-resistant fork of DNSTT by [anonvector](https://github.com/anonvector) (same author as SlipNet). Uses alternative DNS query encoding designed to evade Deep Packet Inspection systems in heavily censored networks. In SlipNet, select **NoizDNS** as the tunnel type for `n` and `z` subdomains.
+>
+> ⚡ **VayDNS:** An optimized fork of DNSTT by [net2share](https://github.com/net2share/vaydns) with KCP/smux reliable sessions, auto-recovery on connection failure, and a leaner wire protocol. Runs in `-dnstt-compat` mode so existing SlipNet/DNSTT clients work. In SlipNet, select **DNSTT** as the tunnel type for `v` and `vz` subdomains.
 
 ---
 
@@ -240,7 +262,7 @@ The wizard has **12 steps**. Here's what each one does:
 <summary><b>Step 3 — 📝 DNS Records (Cloudflare)</b></summary>
 
 - Shows you exactly which DNS records to create in Cloudflare
-- Displays a formatted box with all 7 records (1 A + 6 NS)
+- Displays a formatted box with all 9 records (1 A + 8 NS)
 - Explains why "DNS Only" (grey cloud) is required
 - Waits for your confirmation before proceeding
 </details>
@@ -277,12 +299,16 @@ The wizard has **12 steps**. Here's what each one does:
 <summary><b>Step 7 — 🚇 Create Tunnels</b></summary>
 
 - Asks for DNSTT MTU size (default 1232, range 512–1400) — useful for networks with packet size restrictions
-- Creates 4 tunnels using `dnstm tunnel add`:
+- Creates up to 8 tunnels using `dnstm tunnel add`:
   - `slip1` — Slipstream + SOCKS on `t.yourdomain.com`
-  - `dnstt1` — DNSTT + SOCKS on `d.yourdomain.com` (with configurable MTU)
+  - `dnstt1` — DNSTT + SOCKS on `d.yourdomain.com`
   - `slip-ssh` — Slipstream + SSH on `s.yourdomain.com`
-  - `dnstt-ssh` — DNSTT + SSH on `ds.yourdomain.com` (with configurable MTU)
-- Extracts and displays the DNSTT public key (needed for client config)
+  - `dnstt-ssh` — DNSTT + SSH on `ds.yourdomain.com`
+  - `noiz1` — NoizDNS + SOCKS on `n.yourdomain.com` (if binary available)
+  - `noiz-ssh` — NoizDNS + SSH on `z.yourdomain.com` (if binary available)
+  - `vay1` — VayDNS + SOCKS on `v.yourdomain.com` (if binary available)
+  - `vay-ssh` — VayDNS + SSH on `vz.yourdomain.com` (if binary available)
+- Extracts and displays public keys for DNSTT, NoizDNS, and VayDNS
 - Handles "already exists" gracefully on re-runs
 </details>
 
@@ -290,7 +316,8 @@ The wizard has **12 steps**. Here's what each one does:
 <summary><b>Step 8 — ▶️ Start Services</b></summary>
 
 - Starts the DNS Router
-- Starts all 4 tunnels
+- Starts all tunnels (up to 8)
+- Verifies NoizDNS and VayDNS tunnels started correctly (removes dead ones to protect the router)
 - Shows current tunnel status via `dnstm tunnel list`
 - Handles "already running" gracefully
 </details>
@@ -335,8 +362,8 @@ Runs 6 automated tests:
 
 Displays everything you need:
 - Server IP and domain
-- All 4 tunnel endpoints
-- DNSTT public key
+- All tunnel endpoints (up to 8)
+- DNSTT, NoizDNS, and VayDNS public keys
 - `dnst://` share URLs for dnstc CLI client
 - `slipnet://` deep-link URLs for SlipNet Android app (tap to import) — includes SOCKS credentials when auth is enabled
 - SOCKS proxy credentials (if authentication was enabled) or warning if open
@@ -363,18 +390,20 @@ Create these records in your **Cloudflare** dashboard:
 
 > ☝️ This tells the internet: *"ns.yourdomain.com is at this IP address."*
 
-### Records 2-7 — NS Records (Delegation)
+### Records 2-9 — NS Records (Delegation)
 
 | Type | Name | Target | Tunnel |
 |---|---|---|---|
 | `NS` | `t` | `ns.yourdomain.com` | Slipstream + SOCKS |
 | `NS` | `d` | `ns.yourdomain.com` | DNSTT + SOCKS |
 | `NS` | `n` | `ns.yourdomain.com` | NoizDNS + SOCKS (DPI-resistant) |
+| `NS` | `v` | `ns.yourdomain.com` | VayDNS + SOCKS (optimized) |
 | `NS` | `s` | `ns.yourdomain.com` | Slipstream + SSH |
 | `NS` | `ds` | `ns.yourdomain.com` | DNSTT + SSH |
 | `NS` | `z` | `ns.yourdomain.com` | NoizDNS + SSH (DPI-resistant) |
+| `NS` | `vz` | `ns.yourdomain.com` | VayDNS + SSH (optimized) |
 
-> ☝️ These tell the internet: *"For queries about t/d/n/s/ds/z.yourdomain.com, ask ns.yourdomain.com (your server)."*
+> ☝️ These tell the internet: *"For queries about t/d/n/v/s/ds/z/vz.yourdomain.com, ask ns.yourdomain.com (your server)."*
 
 ### ⚠️ Common Mistakes
 
@@ -402,7 +431,7 @@ sudo bash dnstm-setup.sh --mtu 1200
 # 🌐 Add a backup domain with custom MTU
 sudo bash dnstm-setup.sh --add-domain --mtu 1200
 
-# 🚇 Add a single tunnel (interactive — Slipstream, DNSTT, or NoizDNS)
+# 🚇 Add a single tunnel (interactive — Slipstream, DNSTT, NoizDNS, or VayDNS)
 sudo bash dnstm-setup.sh --add-tunnel
 
 # 🔌 Connect existing Xray panel (3x-ui) via DNS tunnel
@@ -421,6 +450,12 @@ sudo bash dnstm-setup.sh --users
 
 # 📊 Show all tunnels, credentials, and share URLs
 sudo bash dnstm-setup.sh --status
+
+# 📈 Monitor tunnel usage (CPU, memory, connections, logs)
+sudo bash dnstm-setup.sh --monitor
+
+# 🔍 Run tunnel diagnostics (binaries, services, ports, config)
+sudo bash dnstm-setup.sh --diag
 
 # 🗑️ Remove ALL installed components (nuclear option)
 sudo bash dnstm-setup.sh --uninstall
@@ -472,7 +507,7 @@ Each topic gives deep explanations of how things work, why each step is needed, 
 |---|---|
 | 🌐 **Domain** | Your tunnel subdomain (e.g. `t.yourdomain.com`) |
 | 🔍 **DNS Resolver** | Any public resolver (see below) |
-| 🔄 **Transport** | Slipstream (for t/s) or DNSTT (for d) |
+| 🔄 **Transport** | Slipstream (for t/s), DNSTT (for d/v/vz), or NoizDNS (for n/z) |
 | 🔑 **DNSTT Public Key** | The key shown in Step 7 (only for d tunnel) |
 
 ### 🍎 iOS — HTTP Injector
@@ -538,7 +573,7 @@ sudo bash dnstm-setup.sh --manage
 # 📊 Show everything: tunnels, credentials, share URLs (all in one)
 sudo bash dnstm-setup.sh --status
 
-# 🚇 Add a single tunnel (interactive — pick Slipstream/DNSTT/NoizDNS, backend, domain, tag)
+# 🚇 Add a single tunnel (interactive — pick Slipstream/DNSTT/NoizDNS/VayDNS, backend, domain, tag)
 sudo bash dnstm-setup.sh --add-tunnel
 
 # 🔌 Add Xray backend (connect existing 3x-ui panel via DNS tunnel)
@@ -956,6 +991,7 @@ Thank you to **David Fifield** and **EndPositive** for making internet freedom p
 | Project | Description |
 |---|---|
 | 🎛️ [dnstm](https://github.com/net2share/dnstm) | DNS Tunnel Manager CLI |
+| ⚡ [VayDNS](https://github.com/net2share/vaydns) | Optimized DNSTT fork with KCP/smux sessions |
 | 👤 [sshtun-user](https://github.com/net2share/sshtun-user) | Restricted SSH tunnel user manager |
 | 📱 [SlipNet](https://github.com/anonvector/SlipNet) | Android VPN client for DNS tunnels |
 

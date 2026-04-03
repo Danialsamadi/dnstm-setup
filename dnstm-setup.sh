@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dnstm-setup v1.3.1
+# dnstm-setup v1.4.0
 # Interactive DNS Tunnel Setup
 # Sets up Slipstream + DNSTT + NoizDNS + VayDNS tunnels for censorship-resistant internet access
 #
@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 TOTAL_STEPS=12
 
 # ─── Safety: ensure DNS is never left broken on exit ──────────────────────────
