@@ -567,10 +567,12 @@ show_help() {
     echo "  2. DNSTT + SOCKS tunnel       (classic, ~42 KB/s)"
     echo "  3. Slipstream + SSH tunnel    (SSH over DNS)"
     echo "  4. DNSTT + SSH tunnel         (SSH over DNSTT)"
-    echo "  5. VayDNS + SOCKS tunnel     (optimized)"
-    echo "  6. VayDNS + SSH tunnel       (optimized SSH)"
-    echo "  7. microsocks SOCKS5 proxy    (auto-installed by dnstm)"
-    echo "  8. SSH tunnel user (optional)"
+    echo "  5. NoizDNS + SOCKS tunnel    (DPI-resistant)"
+    echo "  6. NoizDNS + SSH tunnel      (DPI-resistant SSH)"
+    echo "  7. VayDNS + SOCKS tunnel     (optimized)"
+    echo "  8. VayDNS + SSH tunnel       (optimized SSH)"
+    echo "  9. microsocks SOCKS5 proxy   (auto-installed by dnstm)"
+    echo "  10. SSH tunnel user (optional)"
     echo ""
     echo -e "${BOLD}CLIENT APP${NC}"
     echo "  SlipNet (Android): https://github.com/anonvector/SlipNet/releases"
@@ -1473,7 +1475,8 @@ do_diag() {
 
     # ─── Config.json transport check ───
     local section_num=3
-    [[ "$has_noiz" == true ]] && section_num=4
+    [[ "$has_noiz" == true ]] && section_num=$((section_num + 1))
+    [[ "$has_vay" == true ]] && section_num=$((section_num + 1))
     echo -e "  ${BOLD}${section_num}. Tunnel Configuration${NC}"
     echo -e "  ${DIM}──────────────────────────${NC}"
 
@@ -3177,6 +3180,20 @@ do_manage_users() {
                                     break
                                 fi
                             done
+                            # VayDNS + SSH
+                            local vay_ssh_pk=""
+                            local vay_ssh_tags
+                            vay_ssh_tags=$(echo "$tunnel_domains" | grep -o 'tag=vay-ssh[^ ]*' | sed 's/tag=//' || true)
+                            for vtag in $vay_ssh_tags; do
+                                if [[ -f "/etc/dnstm/tunnels/${vtag}/server.pub" ]]; then
+                                    vay_ssh_pk=$(cat "/etc/dnstm/tunnels/${vtag}/server.pub" 2>/dev/null || true)
+                                    if [[ -n "$vay_ssh_pk" ]]; then
+                                        url=$(generate_slipnet_url "dnstt_ssh" "vz" "$vay_ssh_pk" "$new_user" "$final_pass" "$s_user" "$s_pass")
+                                        echo -e "  ${GREEN}vz.${dom}:${NC} ${url}"
+                                    fi
+                                    break
+                                fi
+                            done
                         done
                     fi
                 fi
@@ -3302,6 +3319,15 @@ do_manage_users() {
                     if [[ -n "$_noiz_pk" ]]; then
                         url=$(generate_slipnet_url "sayedns_ssh" "z" "$_noiz_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
                         echo -e "  ${GREEN}noiz-ssh (z.${dom}):${NC}"
+                        echo "  ${url}"
+                        echo ""
+                    fi
+                    # VayDNS + SSH
+                    local _vay_pk=""
+                    _vay_pk=$(cat /etc/dnstm/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+                    if [[ -n "$_vay_pk" ]]; then
+                        url=$(generate_slipnet_url "dnstt_ssh" "vz" "$_vay_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
+                        echo -e "  ${GREEN}vay-ssh (vz.${dom}):${NC}"
                         echo "  ${url}"
                         echo ""
                     fi
@@ -4489,8 +4515,8 @@ fix_vaydns_transport() {
     command -v jq &>/dev/null || return 0
 
     local supports_vaydns=false
-    if dnstm tunnel add --help 2>&1 | grep -qi "vaydns" || \
-       dnstm --help 2>&1 | grep -qi "vaydns"; then
+    if timeout 5 dnstm tunnel add --help 2>&1 | grep -qi "vaydns" || \
+       timeout 5 dnstm --help 2>&1 | grep -qi "vaydns"; then
         supports_vaydns=true
     fi
 
@@ -7096,6 +7122,45 @@ do_add_domain() {
         fix_noizdns_transport
     fi
 
+    # VayDNS tunnels — download binary if not available, then create tunnels
+    ensure_vaydns_binary || true
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        local vay_tag="vay${num}"
+        local vay_ssh_tag="vay-ssh${num}"
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SOCKS (optimized)${NC}"
+        echo ""
+        if dnstm tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+        else
+            print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+        fi
+        create_vaydns_service_override "$vay_tag" || print_warn "Could not set VayDNS binary for ${vay_tag}"
+
+        if [[ -f "/etc/dnstm/tunnels/${vay_tag}/server.pub" ]]; then
+            VAYDNS_PUBKEY=$(cat "/etc/dnstm/tunnels/${vay_tag}/server.pub" 2>/dev/null || true)
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SSH (optimized)${NC}"
+        echo ""
+        if dnstm tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+        else
+            print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+        fi
+        create_vaydns_service_override "$vay_ssh_tag" || print_warn "Could not set VayDNS binary for ${vay_ssh_tag}"
+        echo ""
+
+        systemctl stop "dnstm-${vay_tag}.service" 2>/dev/null || true
+        systemctl stop "dnstm-${vay_ssh_tag}.service" 2>/dev/null || true
+
+        fix_vaydns_transport
+    fi
+
     print_ok "All tunnels created"
     echo ""
 
@@ -7111,6 +7176,9 @@ do_add_domain() {
     local _start_tags="$slip_tag $dnstt_tag $slip_ssh_tag $dnstt_ssh_tag"
     if [[ -x /usr/local/bin/noizdns-server ]]; then
         _start_tags+=" ${noiz_tag:-} ${noiz_ssh_tag:-}"
+    fi
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        _start_tags+=" ${vay_tag:-} ${vay_ssh_tag:-}"
     fi
     print_info "Starting new tunnels..."
     for tag in $_start_tags; do
@@ -7154,6 +7222,29 @@ do_add_domain() {
 
     # Fix transport field if dnstm rewrote it during start
     fix_noizdns_transport
+
+    # Verify VayDNS tunnels started
+    for _vtag in ${vay_tag:-} ${vay_ssh_tag:-}; do
+        [[ -z "$_vtag" ]] && continue
+        if dnstm_tag_exists "$_vtag"; then
+            if ! systemctl is-active --quiet "dnstm-${_vtag}.service" 2>/dev/null; then
+                print_info "Waiting for ${_vtag} to start..."
+                sleep 5
+                systemctl restart "dnstm-${_vtag}.service" 2>/dev/null || true
+                sleep 3
+                if systemctl is-active --quiet "dnstm-${_vtag}.service" 2>/dev/null; then
+                    print_ok "VayDNS tunnel ${_vtag} started successfully (after retry)"
+                else
+                    print_warn "VayDNS tunnel ${_vtag} failed to start — removing to protect DNS Router"
+                    dnstm tunnel stop --tag "$_vtag" 2>/dev/null || true
+                    dnstm tunnel remove --tag "$_vtag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnstm-${_vtag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnstm-${_vtag}.service.d" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+    fix_vaydns_transport
 
     # NOW start the router (all backends are healthy)
     echo ""
