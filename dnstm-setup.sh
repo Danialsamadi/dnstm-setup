@@ -1984,6 +1984,10 @@ write_service_override() {
     local dropin_dir="/etc/systemd/system/${unit}.d"
     local dropin_file="${dropin_dir}/20-hardening.conf"
 
+    # DNS router may need more memory on high-traffic servers
+    local mem_limit="512M"
+    [[ "$unit" == "dnstm-dnsrouter.service" ]] && mem_limit="1G"
+
     mkdir -p "$dropin_dir"
 
     cat > "$dropin_file" <<EOF
@@ -2009,9 +2013,11 @@ RestrictNamespaces=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 UMask=0077
-StandardOutput=null
-StandardError=null
-MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+MemoryMax=${mem_limit}
 EOF
 
     if [[ "$needs_bind_cap" == "yes" ]]; then
@@ -2046,24 +2052,18 @@ enable_autostart_units() {
     print_ok "Boot autostart enabled for dnstm and microsocks services"
 }
 
-# ─── Log Rotation & Journald Size Limits ──────────────────────────────────────
+# ─── Rsyslog Filter & Journald Size Limits ────────────────────────────────────
 
-install_logrotate_syslog() {
-    local logrotate_file="/etc/logrotate.d/dnstm-syslog-limit"
-    cat > "$logrotate_file" <<'EOF'
-/var/log/syslog {
-    size 500M
-    rotate 2
-    compress
-    missingok
-    notifempty
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || invoke-rc.d rsyslog rotate >/dev/null 2>&1 || true
-    endscript
-}
+install_rsyslog_filter() {
+    local rsyslog_file="/etc/rsyslog.d/10-dnstm-suppress.conf"
+    cat > "$rsyslog_file" <<'EOF'
+:programname, isequal, "dnstt-server" stop
+:programname, isequal, "noizdns-server" stop
+:programname, isequal, "vaydns-server" stop
 EOF
-    chmod 644 "$logrotate_file"
-    print_ok "Installed syslog rotation rule: $logrotate_file"
+    chmod 644 "$rsyslog_file"
+    systemctl restart rsyslog 2>/dev/null || true
+    print_ok "Installed rsyslog filter: $rsyslog_file (suppresses tunnel log flood to syslog)"
 }
 
 configure_journald_limit() {
@@ -2150,7 +2150,7 @@ apply_service_hardening() {
     fi
 
     enable_autostart_units
-    install_logrotate_syslog
+    install_rsyslog_filter
     configure_journald_limit
     print_ok "Applied systemd hardening overrides"
     return 0
@@ -2980,11 +2980,12 @@ do_uninstall() {
     # Remove resolver override used to free port 53
     rm -f /etc/systemd/resolved.conf.d/10-dnstm-no-stub.conf 2>/dev/null || true
 
-    # Remove logrotate rule and journald limits
-    rm -f /etc/logrotate.d/dnstm-syslog-limit 2>/dev/null || true
+    # Remove rsyslog filter and journald limits
+    rm -f /etc/rsyslog.d/10-dnstm-suppress.conf 2>/dev/null || true
+    systemctl restart rsyslog 2>/dev/null || true
     rm -f /etc/systemd/journald.conf.d/10-dnstm-limit.conf 2>/dev/null || true
     rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
-    print_ok "Removed log rotation and journald limit configs"
+    print_ok "Removed rsyslog filter and journald limit configs"
 
     # Unlock resolv.conf so the system can manage DNS again
     chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -3033,10 +3034,20 @@ do_cleanup() {
     print_info "This operation will:"
     echo "  1. Truncate /var/log/syslog and /var/log/syslog.1 (emergency disk recovery)"
     echo "  2. Vacuum journald to 100M (compact journal)"
-    echo "  3. Install syslog rotation rule (size 500M, rotate 2 files)"
+    echo "  3. Install rsyslog filter (suppress tunnel log flood to syslog)"
     echo "  4. Configure journald size limits (200M system / 100M runtime)"
-    echo "  5. Apply log suppression to all tunnel services"
-    echo "  6. Apply memory limit (512M) to all tunnel services"
+    echo "  5. Apply log rate limiting and memory limits to tunnel services"
+    echo ""
+    echo -e "  ${YELLOW}Warning: This will restart all tunnel services. Active connections${NC}"
+    echo -e "  ${YELLOW}will be briefly interrupted (each service restarted one at a time).${NC}"
+    echo ""
+
+    if ! prompt_yn "Continue with cleanup?" "y"; then
+        echo ""
+        print_info "Cleanup cancelled."
+        return 0
+    fi
+
     echo ""
 
     local before_df
@@ -3063,15 +3074,15 @@ do_cleanup() {
     journalctl --vacuum-size=100M 2>/dev/null || true
     print_ok "Vacuumed journald"
 
-    # Step 3 & 4: Install logrotate and journald limits
+    # Step 3 & 4: Install rsyslog filter and journald limits
     echo ""
-    install_logrotate_syslog
+    install_rsyslog_filter
     configure_journald_limit
 
-    # Step 5 & 6: Apply log suppression and memory limits to all dnstm services
+    # Step 5: Apply rate limiting and memory limits to all dnstm services
     if command -v dnstm &>/dev/null; then
         echo ""
-        print_info "Applying log suppression and memory limits to tunnel services..."
+        print_info "Applying log rate limiting and memory limits to tunnel services..."
 
         local dnstm_units
         dnstm_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnstm-.*\.service$/ {print $1}' || true)
@@ -3098,10 +3109,11 @@ do_cleanup() {
                 fi
                 if systemctl is-enabled "$unit" &>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
                     systemctl restart "$unit" 2>/dev/null && print_ok "Restarted: $unit" || print_warn "Could not restart: $unit"
+                    sleep 1
                 fi
             done
 
-            print_ok "Applied log suppression and memory limits"
+            print_ok "Applied log rate limiting and memory limits"
         else
             print_warn "No dnstm services found to update"
         fi
@@ -3115,8 +3127,6 @@ do_cleanup() {
     echo "  $after_df"
     echo ""
     print_ok "${GREEN}Cleanup complete.${NC}"
-    echo ""
-    print_info "Recommended: Monitor logs with: tail -f /var/log/syslog"
     echo ""
 }
 
@@ -7613,6 +7623,7 @@ ADD_DOMAIN_MODE=false
 ADD_DOMAIN_ARG=""
 ADD_XRAY_MODE=false
 HARDEN_ONLY_MODE=false
+CLEANUP_MODE=false
 UPDATE_MODE=false
 MANAGE_USERS_MODE=false
 DNSTT_MTU=1232
