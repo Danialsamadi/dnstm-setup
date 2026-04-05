@@ -538,6 +538,7 @@ show_help() {
     echo "  sudo bash dnstm-setup.sh --add-xray    Connect existing Xray panel via DNS tunnel"
     echo "  sudo bash dnstm-setup.sh --remove-tunnel [tag]  Remove a specific tunnel"
     echo "  sudo bash dnstm-setup.sh --harden      Apply security hardening only"
+    echo "  sudo bash dnstm-setup.sh --cleanup     Emergency disk cleanup (truncate logs, vacuum journal)"
     echo "  sudo bash dnstm-setup.sh --uninstall   Remove everything"
     echo "  sudo bash dnstm-setup.sh --status      Show all tunnels & share URLs"
     echo "  sudo bash dnstm-setup.sh --monitor     Monitor tunnel usage & connections"
@@ -559,6 +560,7 @@ show_help() {
     echo "  --users        Manage SSH tunnel users (add, list, update, delete)"
     echo "  --mtu <value>  Set DNSTT MTU size (512-1400, default: 1232)"
     echo "  --harden       Apply service and resolver hardening to an existing setup"
+    echo "  --cleanup      Emergency disk cleanup (truncate logs, vacuum journal, apply fixes)"
     echo "  --update       Check for updates and install latest version"
     echo "  --uninstall    Remove all installed components"
     echo ""
@@ -2007,6 +2009,9 @@ RestrictNamespaces=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 UMask=0077
+StandardOutput=null
+StandardError=null
+MemoryMax=512M
 EOF
 
     if [[ "$needs_bind_cap" == "yes" ]]; then
@@ -2039,6 +2044,41 @@ enable_autostart_units() {
         fi
     done
     print_ok "Boot autostart enabled for dnstm and microsocks services"
+}
+
+# ─── Log Rotation & Journald Size Limits ──────────────────────────────────────
+
+install_logrotate_syslog() {
+    local logrotate_file="/etc/logrotate.d/dnstm-syslog-limit"
+    cat > "$logrotate_file" <<'EOF'
+/var/log/syslog {
+    size 500M
+    rotate 2
+    compress
+    missingok
+    notifempty
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || invoke-rc.d rsyslog rotate >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    chmod 644 "$logrotate_file"
+    print_ok "Installed syslog rotation rule: $logrotate_file"
+}
+
+configure_journald_limit() {
+    local journald_dir="/etc/systemd/journald.conf.d"
+    local journald_file="${journald_dir}/10-dnstm-limit.conf"
+    
+    mkdir -p "$journald_dir"
+    cat > "$journald_file" <<'EOF'
+[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=100M
+EOF
+    chmod 644 "$journald_file"
+    systemctl restart systemd-journald 2>/dev/null || true
+    print_ok "Configured journald size limits: $journald_file"
 }
 
 apply_service_hardening() {
@@ -2110,6 +2150,8 @@ apply_service_hardening() {
     fi
 
     enable_autostart_units
+    install_logrotate_syslog
+    configure_journald_limit
     print_ok "Applied systemd hardening overrides"
     return 0
 }
@@ -2938,6 +2980,12 @@ do_uninstall() {
     # Remove resolver override used to free port 53
     rm -f /etc/systemd/resolved.conf.d/10-dnstm-no-stub.conf 2>/dev/null || true
 
+    # Remove logrotate rule and journald limits
+    rm -f /etc/logrotate.d/dnstm-syslog-limit 2>/dev/null || true
+    rm -f /etc/systemd/journald.conf.d/10-dnstm-limit.conf 2>/dev/null || true
+    rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
+    print_ok "Removed log rotation and journald limit configs"
+
     # Unlock resolv.conf so the system can manage DNS again
     chattr -i /etc/resolv.conf 2>/dev/null || true
     print_ok "Removed immutable flag from /etc/resolv.conf"
@@ -2966,6 +3014,109 @@ DNSEOF
     echo ""
     print_warn "Note: DNS records in Cloudflare were NOT removed. Remove them manually if needed."
     print_warn "Note: Xray/3x-ui panel was NOT removed (only DNSTT tunnel configs were cleaned up)."
+    echo ""
+}
+
+# ─── Emergency Disk Cleanup ────────────────────────────────────────────────────
+
+do_cleanup() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --cleanup"
+        exit 1
+    fi
+
+    print_header "Disk Space Cleanup & Log Management"
+
+    echo ""
+    print_info "This operation will:"
+    echo "  1. Truncate /var/log/syslog and /var/log/syslog.1 (emergency disk recovery)"
+    echo "  2. Vacuum journald to 100M (compact journal)"
+    echo "  3. Install syslog rotation rule (size 500M, rotate 2 files)"
+    echo "  4. Configure journald size limits (200M system / 100M runtime)"
+    echo "  5. Apply log suppression to all tunnel services"
+    echo "  6. Apply memory limit (512M) to all tunnel services"
+    echo ""
+
+    local before_df
+    before_df=$(df -h / | tail -1)
+    echo -e "  ${DIM}Disk before cleanup:${NC}"
+    echo "  $before_df"
+    echo ""
+
+    # Step 1: Truncate syslog files
+    if [[ -f /var/log/syslog ]]; then
+        print_info "Truncating /var/log/syslog..."
+        > /var/log/syslog
+        print_ok "Truncated /var/log/syslog"
+    fi
+
+    if [[ -f /var/log/syslog.1 ]]; then
+        print_info "Truncating /var/log/syslog.1..."
+        > /var/log/syslog.1
+        print_ok "Truncated /var/log/syslog.1"
+    fi
+
+    # Step 2: Vacuum journald
+    print_info "Vacuuming journald to 100M..."
+    journalctl --vacuum-size=100M 2>/dev/null || true
+    print_ok "Vacuumed journald"
+
+    # Step 3 & 4: Install logrotate and journald limits
+    echo ""
+    install_logrotate_syslog
+    configure_journald_limit
+
+    # Step 5 & 6: Apply log suppression and memory limits to all dnstm services
+    if command -v dnstm &>/dev/null; then
+        echo ""
+        print_info "Applying log suppression and memory limits to tunnel services..."
+
+        local dnstm_units
+        dnstm_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnstm-.*\.service$/ {print $1}' || true)
+
+        if [[ -n "$dnstm_units" ]]; then
+            local unit
+            for unit in $dnstm_units; do
+                if [[ "$unit" == "dnstm-dnsrouter.service" ]]; then
+                    write_service_override "$unit" "dnstm" "dnstm" "yes"
+                else
+                    write_service_override "$unit" "dnstm" "dnstm" "no"
+                fi
+            done
+
+            if unit_exists "microsocks.service"; then
+                write_service_override "microsocks.service" "nobody" "nogroup" "no"
+            fi
+
+            systemctl daemon-reload 2>/dev/null || true
+
+            for unit in $dnstm_units microsocks.service; do
+                if ! unit_exists "$unit"; then
+                    continue
+                fi
+                if systemctl is-enabled "$unit" &>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+                    systemctl restart "$unit" 2>/dev/null && print_ok "Restarted: $unit" || print_warn "Could not restart: $unit"
+                fi
+            done
+
+            print_ok "Applied log suppression and memory limits"
+        else
+            print_warn "No dnstm services found to update"
+        fi
+    fi
+
+    # Report disk space after cleanup
+    echo ""
+    local after_df
+    after_df=$(df -h / | tail -1)
+    echo -e "  ${DIM}Disk after cleanup:${NC}"
+    echo "  $after_df"
+    echo ""
+    print_ok "${GREEN}Cleanup complete.${NC}"
+    echo ""
+    print_info "Recommended: Monitor logs with: tail -f /var/log/syslog"
     echo ""
 }
 
@@ -4992,13 +5143,14 @@ do_manage() {
         echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
         echo -e "  ${BOLD}10)${NC} Update script         ${DIM}(check for new versions)${NC}"
-        echo -e "  ${BOLD}${RED}11)${NC} ${RED}Uninstall everything${NC}"
+        echo -e "  ${BOLD}11)${NC} Cleanup & recover     ${DIM}(emergency disk cleanup, log suppression)${NC}"
+        echo -e "  ${BOLD}${RED}12)${NC} ${RED}Uninstall everything${NC}"
         echo ""
         echo -e "  ${BOLD}0)${NC}  Exit"
         echo ""
 
         local choice=""
-        read -rp "  Select [0-11]: " choice || break
+        read -rp "  Select [0-12]: " choice || break
 
         case "$choice" in
             1)
@@ -5039,6 +5191,9 @@ do_manage() {
                 fi
                 ;;
             11)
+                ( trap - INT; do_cleanup ) || true
+                ;;
+            12)
                 ( trap - INT; do_uninstall ) || true
                 # If uninstall succeeded, dnstm is gone — exit menu
                 hash -d dnstm 2>/dev/null || true
@@ -5057,7 +5212,7 @@ do_manage() {
                 continue
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-11."
+                print_warn "Invalid choice. Enter 0-12."
                 sleep 1
                 continue
                 ;;
@@ -7527,6 +7682,10 @@ while [[ $# -gt 0 ]]; do
             HARDEN_ONLY_MODE=true
             shift
             ;;
+        --cleanup)
+            CLEANUP_MODE=true
+            shift
+            ;;
         --update)
             UPDATE_MODE=true
             shift
@@ -7554,10 +7713,11 @@ mode_count=0
 [[ "$ADD_DOMAIN_MODE" == true ]] && ((mode_count++)) || true
 [[ "$ADD_XRAY_MODE" == true ]] && ((mode_count++)) || true
 [[ "$HARDEN_ONLY_MODE" == true ]] && ((mode_count++)) || true
+[[ "$CLEANUP_MODE" == true ]] && ((mode_count++)) || true
 [[ "$UPDATE_MODE" == true ]] && ((mode_count++)) || true
 [[ "$MANAGE_USERS_MODE" == true ]] && ((mode_count++)) || true
 if [[ $mode_count -gt 1 ]]; then
-    echo "Error: --add-domain, --add-xray, --harden, --update, and --users cannot be combined."
+    echo "Error: --add-domain, --add-xray, --harden, --cleanup, --update, and --users cannot be combined."
     exit 1
 fi
 
@@ -7585,6 +7745,8 @@ main() {
 
 if [[ "$HARDEN_ONLY_MODE" == true ]]; then
     do_harden
+elif [[ "$CLEANUP_MODE" == true ]]; then
+    do_cleanup
 elif [[ "$UPDATE_MODE" == true ]]; then
     do_update
 elif [[ "$ADD_DOMAIN_MODE" == true ]]; then
